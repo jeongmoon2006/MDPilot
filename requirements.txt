@@ -1,1 +1,6 @@
-pocketflow>=0.0.1
+pocketflow
+google-genai
+MDAnalysis
+scholarly
+PyYAML
+numpy
