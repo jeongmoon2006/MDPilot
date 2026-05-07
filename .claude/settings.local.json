@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import sys; print\\('python', sys.executable\\)\")",
+      "Bash(python3 -c \"import openmm; print\\('openmm', openmm.version.full_version\\)\")",
+      "Bash(python3 -c \"import anthropic; print\\('anthropic', anthropic.__version__\\)\")",
+      "Bash(python3 -c \"import MDAnalysis; print\\('mdanalysis', MDAnalysis.__version__\\)\")",
+      "Bash(python3 -c \"import mdtraj; print\\('mdtraj', mdtraj.__version__\\)\")",
+      "Bash(python3 -c \"import numpy, scipy, pytest; print\\('numpy', numpy.__version__\\); print\\('scipy', scipy.__version__\\); print\\('pytest', pytest.__version__\\)\")",
+      "Bash(conda env *)",
+      "Read(//home/jeongmoon/miniconda3/**)",
+      "Read(//home/jeongmoon/anaconda3/**)",
+      "Read(//home/jeongmoon/miniforge3/**)",
+      "Read(//opt/conda/**)",
+      "Bash(python3 -c \"import site; print\\(site.getusersitepackages\\(\\)\\)\")",
+      "Bash(pip3 list *)",
+      "Bash(env)",
+      "Bash(python3 -m venv --help)",
+      "Bash(cmd.exe /c \"echo %ANTHROPIC_API_KEY%\")",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/python -m pip install --upgrade pip)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(nvidia-smi)",
+      "Read(//usr/lib/wsl/lib/**)",
+      "Read(//usr/local/**)",
+      "Skill(claude-api)"
+    ]
+  }
+}

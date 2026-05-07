@@ -1,0 +1,41 @@
+# Milestone 1 benchmark: convergence judgment on Trp-cage RMSD-from-first-frame.
+#
+# Loaded by benchmarks/runners.py (Milestone 6) to standardize how the campaign
+# is configured. In Milestone 1 this is documentation of the task — the loop
+# is invoked directly via mdpilot.orchestrator.loop.run_campaign().
+
+name: trpcage_convergence
+description: |
+  Trp-cage in TIP3P water from PDB 1L2Y. Run vanilla MD and judge whether the
+  CA-RMSD-from-first-frame time series is converged (plateaued + adequate ESS).
+  This is a convergence-of-observable task, not a folding task — Trp-cage
+  folding requires microseconds and is out of scope for Milestone 1.
+
+system:
+  starting_pdb: "1L2Y"        # downloaded via PDBFixer
+  forcefield: ["amber14-all.xml", "amber14/tip3p.xml"]
+  water_model: tip3p
+  padding_nm: 1.0
+  ionic_strength_M: 0.15
+
+integrator:
+  type: LangevinMiddle
+  temperature_K: 300.0
+  friction_per_ps: 1.0
+  timestep_fs: 2.0
+  constraints: HBonds
+
+observable:
+  name: rmsd_ca_to_first_angstrom
+  selection: "protein and name CA"
+  reference: first_frame
+
+diagnostics:
+  - block_averaging
+  - autocorrelation
+  target_ess: 50
+
+# Done criterion (per ROADMAP.md, Milestone 1):
+# Scientist correctly says "extend" on a planted under-converged trajectory
+# (e.g. a 20–50 ps run from the energy minimum, where the RMSD time series
+# is dominated by the initial relaxation transient).

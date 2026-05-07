@@ -19,6 +19,26 @@ __pycache__/
 .env.test
 .env.production
 
+# Python virtualenv + build artifacts
+.venv/
+venv/
+*.egg-info/
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.ipynb_checkpoints/
+
+# MDPilot runtime
+benchmarks/data/
+campaigns/
+
+# Trajectories (regenerable, often large)
+*.dcd
+*.xtc
+*.trr
+
 # IDE - VSCode
 .vscode/*
 !.vscode/settings.json

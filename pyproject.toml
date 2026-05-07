@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdpilot"
+version = "0.0.1"
+description = "Closed-loop scientific reasoning agent for molecular dynamics"
+readme = "docs/architecture.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Jeongmoon Choi" }]
+dependencies = [
+  "openmm>=8.1",
+  "mdtraj>=1.10",
+  "numpy>=1.26",
+  "scipy>=1.13",
+  "anthropic>=0.40",
+  "pyyaml>=6.0",
+  "pdbfixer>=1.10",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
