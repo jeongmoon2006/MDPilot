@@ -1,6 +1,0 @@
-pocketflow
-google-genai
-MDAnalysis
-scholarly
-PyYAML
-numpy
