@@ -38,13 +38,18 @@ This is real physics (slow sub-state interconversion on the native basin), not a
 
 ## 2. Session journal
 
-### 2026-05-11 — orientation + activity-log scaffolding
+### 2026-05-11 — orientation, activity log, close out M1 tests
 - Recovered context from auto-memory (loop shape, Trp-cage 5 ns finding, env baseline).
-- Current repo state on `main`:
-  - `c95e66d "changed the design"` is HEAD — the commit that landed the M1 skeleton (orchestrator/loop, orchestrator/scientist, diagnostics, openmm adapter, benchmarks, tests).
-  - One uncommitted change: `tests/integration/test_milestone1_live.py` (unstaged, not yet reviewed this session).
-- Created this file at user request to track activity going forward.
-- **Open / next:** inspect the uncommitted diff in `test_milestone1_live.py` and decide whether to keep, refine, or revert.
+- Created `docs/activity-log.md` to track decisions + per-session journal going forward.
+- Walked the full repo structure vs the architecture target. M1 modules (`orchestrator/loop.py`, `orchestrator/scientist.py`, `diagnostics/*`, `adapters/openmm_runner.py`) are in place; reasoning/sampling/ensemble/execution/memory/tools subtrees are still empty per ROADMAP M2–M5.
+- Reviewed the uncommitted `tests/integration/test_milestone1_live.py` diff. It replaces the unreachable "stop on real 5 ns Trp-cage" assertion with two more honest tests: extend-on-5ns (negative guard tied to F1) + stop-on-synthetic (stop-path coverage via `_summarize` on iid Gaussian noise). Kept as-is.
+- Committed in two pieces:
+  - `1d27c6d` tests: refine Milestone 1 done-criterion to match real Trp-cage behavior
+  - `5a083a6` docs: add activity log
+- `git pull --rebase` was a no-op; `git push` failed (HTTPS remote, no creds, no `gh` installed). Push left for the user to run manually.
+- `.claude/settings.local.json` has new permission entries this session (git fetch/add/commit/pull/stash/push, gh auth) — left uncommitted by user choice.
+- **M1 status:** the closed-loop scientist runs end-to-end on Trp-cage convergence and the done-criterion tests now match real physics. M1 is effectively complete pending the push landing.
+- **Open / next:** push the two local commits; then start M2 (SQLite memory layer + resume-from-disk).
 
 ### 2026-05-06/07 — Milestone 1 skeleton landed (`c95e66d`)
 Large foundational commit. New layout:

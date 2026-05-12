@@ -24,7 +24,14 @@
       "Bash(nvidia-smi)",
       "Read(//usr/lib/wsl/lib/**)",
       "Read(//usr/local/**)",
-      "Skill(claude-api)"
+      "Skill(claude-api)",
+      "Bash(git fetch *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)",
+      "Bash(git push *)",
+      "Bash(gh auth *)"
     ]
   }
 }
