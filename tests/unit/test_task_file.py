@@ -482,6 +482,49 @@ def test_an_unknown_equilibration_key_raises(tmp_path: Path) -> None:
         load_task_file(_write(tmp_path, doc))
 
 
+def test_a_misspelled_wall_raises_rather_than_going_unbounded(tmp_path: Path) -> None:
+    """The worst case in the file: every `sampling` key is mapped, so an
+    unrecognised one is dropped rather than merely uninterpreted. A lost
+    `cv_upper_wall_nm` leaves the biased CV unbounded above, which is F6 — the
+    failure that field was added to prevent."""
+    doc = _minimal()
+    doc["sampling"] = {"cv_upper_wal_nm": 0.8}        # one character short
+
+    with pytest.raises(ValueError, match="unknown sampling key"):
+        load_task_file(_write(tmp_path, doc))
+
+
+def test_an_unknown_diagnostics_key_raises(tmp_path: Path) -> None:
+    """`target_ess` is verified against `autocorrelation`'s own default, and a
+    typo would skip that check instead of failing it."""
+    doc = _minimal()
+    doc["diagnostics"] = {"target_es": 50}
+
+    with pytest.raises(ValueError, match="unknown diagnostics key"):
+        load_task_file(_write(tmp_path, doc))
+
+
+def test_every_sampling_key_the_check_allows_is_one_the_loop_takes(
+    tmp_path: Path,
+) -> None:
+    """The check and the mapper read one constant, but the mapper's output has
+    to survive `run_kwargs` too — a key allowed here and unknown to
+    `run_campaign` would pass the file and fail at launch."""
+    from mdpilot.task_file import _SAMPLING_KEYS
+
+    doc = _minimal()
+    doc["sampling"] = {
+        "cv_upper_wall_nm": 0.8, "bias_pace": 250,
+        "bias_factor": 15.0, "max_cv_switches": 2,
+    }
+    assert set(doc["sampling"]) == _SAMPLING_KEYS   # this test covers them all
+
+    task = load_task_file(_write(tmp_path, doc))
+
+    assert {k: task.campaign[k] for k in _SAMPLING_KEYS} == doc["sampling"]
+    task.run_kwargs()   # raises if any of them is not a run_campaign parameter
+
+
 def test_the_headless_runner_builds_the_same_campaign_as_the_app(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -91,6 +91,11 @@ _EXPECTATION_KEYS = {"objective", "characteristic_timescale_ns", "timescale_sour
 _DONE_CRITERION_KEYS = {"states", "min_recrossings", "max_biased_ns", "pivot_required"}
 _STATE_KEYS = {"name", "threshold"}
 _OBSERVABLE_KEYS = {"cv_type", "selections", "name", "scale", "normalize", "reference"}
+# Enhanced-sampling knobs, mapped straight onto `run_campaign` keywords of the
+# same name. One constant rather than a literal in `_build_campaign` and
+# another in the check: a key the check allows but the mapper ignores is
+# exactly the silent drop this block is checked to prevent.
+_SAMPLING_KEYS = {"cv_upper_wall_nm", "bias_pace", "bias_factor", "max_cv_switches"}
 
 
 @dataclass(frozen=True)
@@ -164,6 +169,24 @@ def load_task_file(path: Path) -> TaskFile:
     _reject_unknown(
         "equilibration", set(doc.get("equilibration") or {}),
         _EQUILIBRATION_KEYS, path,
+    )
+    # `sampling` carries no verified or informational keys — every key in it is
+    # mapped — so a typo here is not merely undeclared, it is dropped. Silently
+    # losing `cv_upper_wall_nm` leaves the biased CV unbounded above, which is
+    # F6: well-tempered metaD drives the walker outward with nothing to turn it
+    # around. The field exists to prevent that, so a misspelling of it must not
+    # reproduce it.
+    _reject_unknown("sampling", set(doc.get("sampling") or {}), _SAMPLING_KEYS, path)
+    # Every `diagnostics` key is verified or informational, so the allowed set
+    # is derived from those tables the same way `_build_spec` derives `system`
+    # and `integrator`. A typo'd `target_ess` would otherwise skip the check
+    # that keeps the declared value and `autocorrelation`'s own default in step.
+    _reject_unknown(
+        "diagnostics",
+        set(doc.get("diagnostics") or {}),
+        {k for s, k in _VERIFIED if s == "diagnostics"}
+        | {k for s, k in _INFORMATIONAL if s == "diagnostics"},
+        path,
     )
     _check_expectation(doc, path)
     _verify_declared_constants(doc, path)
@@ -380,7 +403,7 @@ def _build_campaign(doc: dict[str, Any]) -> dict[str, Any]:
         campaign["task_expectation"] = render_task_expectation(doc)
 
     sampling = doc.get("sampling") or {}
-    for key in ("cv_upper_wall_nm", "bias_pace", "bias_factor", "max_cv_switches"):
+    for key in _SAMPLING_KEYS:
         if key in sampling:
             campaign[key] = sampling[key]
 
