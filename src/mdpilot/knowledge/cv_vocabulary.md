@@ -30,10 +30,12 @@ resSeq 1 to 10"]`.
 - `rmsd`: 1 selection, must resolve to ≥3 atoms. RMSD to the campaign's
 reference structure after optimal superposition — the usual folding order
 parameter. Example: `["name CA"]`.
-- `contacts`: 1 selection, must resolve to ≥2 atoms. A smooth count of the
-native contacts formed among the selected atoms, running from ~0 (none) to the
-number of contacts present in the reference structure. Pairs closer than 3
-residues in sequence are excluded, since those are formed in any conformation.
+- `contacts`: 1 selection, must resolve to ≥2 atoms. The *fraction* of native
+contacts formed among the selected atoms, on [0, 1]: 1 is the reference
+structure's full set, 0 is none. Every number you see for it — the biased
+coordinate, `cv_min`/`cv_max`, the free-energy axis — is that fraction, not a
+count. Pairs closer than 3 residues in sequence are excluded, since those are
+formed in any conformation.
 Example: `["name CA"]`. For folding and unfolding this is usually a better
 coordinate than `rmsd`: it measures how much of the native structure is
 present rather than how far the whole chain has moved, and because it is

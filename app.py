@@ -37,7 +37,7 @@ import streamlit.components.v1 as components  # noqa: E402
 
 from mdpilot.diagnostics import free_energy  # noqa: E402
 from mdpilot.memory import store  # noqa: E402
-from mdpilot.orchestrator.loop import run_campaign  # noqa: E402
+from mdpilot.orchestrator.loop import run_campaign, steps_per_ns_for  # noqa: E402
 from mdpilot.task_file import load_task_file  # noqa: E402
 
 CAMPAIGNS = Path("campaigns")
@@ -501,12 +501,13 @@ def render_configurator() -> None:
         task_path = work_dir / "task.yaml"
         task_path.write_text(st.session_state["yaml"])
         try:
-            load_task_file(task_path)          # fail before a thread is started
+            task = load_task_file(task_path)   # fail before a thread is started
         except Exception as exc:
             st.error(f"{type(exc).__name__}: {exc}")
         else:
-            timestep_fs = load_task_file(task_path).spec.ensemble.timestep_fs
-            steps_per_ns = int(round(1e6 / timestep_fs))
+            # The loop's own conversion, read from the adapter the task builds,
+            # rather than a second copy of `1e6 / timestep` here.
+            steps_per_ns = steps_per_ns_for(task.build_adapter(work_dir))
             fresh = CampaignRun(work_dir=work_dir)
             start_campaign(
                 fresh,

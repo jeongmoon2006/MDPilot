@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import numpy as np
+
 _DB_FILENAME = "state.db"
 
 # --- campaign config compatibility -----------------------------------------
@@ -274,9 +276,11 @@ def append_round(
     loop can reconstruct it on resume.
 
     ``plumed_dat_path`` marks a round run under a metadynamics bias: NULL for a
-    vanilla round, the path to the plumed.dat that drove it otherwise. It is
-    both the phase marker and the audit artifact — reading it back recovers the
-    exact bias config for that round.
+    vanilla round, the path to the live plumed.dat otherwise. That file is
+    rewritten in place by every pivot and CV switch, so it is the phase marker
+    but not the audit artifact: the bias this round actually ran under is the
+    copy the loop snapshots beside the checkpoint,
+    ``rounds/round_NNN.plumed.dat``.
     """
     with _connect(work_dir) as conn:
         conn.execute(
@@ -475,4 +479,10 @@ def _now_iso() -> str:
 def _json_default(o: Any) -> Any:
     if isinstance(o, Path):
         return str(o)
+    # Same tolerance as the loop's per-round JSON writer, which runs *before*
+    # this insert. Without it a single uncast numpy scalar in a report wrote
+    # rounds/round_NNN.json and then killed the campaign here, after the
+    # round's MD was spent, with no row to resume from.
+    if isinstance(o, (np.floating, np.integer)):
+        return o.item()
     raise TypeError(f"not JSON-serializable: {type(o)}")

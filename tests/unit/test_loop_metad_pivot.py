@@ -1428,3 +1428,226 @@ def test_wall_warnings_reach_the_scientist_through_the_ledger(
     from mdpilot.adapters.plumed_writer import ContactsCV
 
     assert _wall_notes(ContactsCV(label="q", pairs=((0, 1),), r0_nm=0.75), None, None) == []
+
+
+# ---------- a proposal the topology cannot resolve ----------
+
+def test_an_unresolvable_proposal_becomes_an_extend_on_record(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Before this, the first resolution of a proposal happened inside the
+    pivot, after the round was persisted as `switch_to_metad`: it raised, and
+    every restart re-entered the pivot branch and raised again with `decide()`
+    never called. The campaign was unrecoverable without editing state.db.
+    Now the refusal is an extend with the error on the ledger, and the next
+    round proposes again."""
+    from mdpilot.orchestrator.scientist import UnresolvableProposal
+
+    _stub_collaborators(monkeypatch, [_extend(), _stop()])
+    scripted = loop_mod.decide
+    refused = UnresolvableProposal(
+        _switch(), "cv_designer: selection 'name CB' resolved to 0 atoms", 3
+    )
+    calls = {"n": 0}
+
+    def refuse_first(report, **kwargs):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise refused
+        return scripted(report, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "decide", refuse_first)
+    events: list[tuple[str, dict]] = []
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_rounds=5,
+        on_event=lambda name, payload: events.append((name, payload)),
+        **_run_kwargs(),
+    )
+
+    rows = store.list_rounds(tmp_path)
+    assert [r.decision for r in rows] == ["extend", "extend", "stop"]
+    assert rows[0].metad_proposal is None            # nothing for a resume to rebuild
+    assert result.stop_reason == "scientist_said_stop"
+    notes = [n.text for n in store.list_ledger_notes(tmp_path) if n.round_index == 1]
+    assert any("proposal refused" in n and "resolved to 0 atoms" in n for n in notes)
+    overrides = [p["note"] for name, p in events if name == "override"]
+    assert len(overrides) == 1 and "proposal refused" in overrides[0]
+
+
+def test_the_proposal_validator_resolves_against_the_campaign_topology(
+    tmp_path: Path,
+) -> None:
+    import mdtraj as md
+
+    adapter = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    adapter.start()
+    validate = loop_mod._proposal_validator(md.load(str(adapter.topology_path)))
+
+    validate(MetadProposal(cv_type="gyration", selections=("name CA",), label="rg"))
+    with pytest.raises(ValueError, match="resolved to 0 atoms"):
+        validate(MetadProposal(cv_type="gyration", selections=("name CB",), label="rg"))
+    with pytest.raises(ValueError, match="distance requires 2"):
+        validate(MetadProposal(cv_type="distance", selections=("name CA",), label="d"))
+    # `rmsd` writes a reference PDB while resolving; a rejected or merely
+    # validated proposal must leave nothing in the campaign directory.
+    validate(MetadProposal(cv_type="rmsd", selections=("name CA",), label="r"))
+    assert not list(tmp_path.rglob("r_reference.pdb"))
+
+
+def test_the_extension_ceiling_and_validator_are_passed_to_the_scientist(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _stub_collaborators(monkeypatch, [_stop()])
+    scripted = loop_mod.decide
+    seen: dict = {}
+
+    def spy(report, **kwargs):  # noqa: ANN001
+        seen.update(kwargs)
+        return scripted(report, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "decide", spy)
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_extra_ns=0.75,
+        **_run_kwargs(),
+    )
+
+    assert seen["max_extra_ns"] == 0.75
+    assert callable(seen["validate_proposal"])
+
+
+# ---------- rounds shorter than one trajectory frame ----------
+
+def test_an_extend_shorter_than_one_frame_is_floored_to_a_frame() -> None:
+    """`extra_ns` has no lower bound in the tool schema. A round shorter than
+    the reporter interval writes a 0-byte DCD that mdtraj cannot open, the
+    report raises after the MD is spent, and restart re-derives the same
+    length from the stored `extra_ns`."""
+    assert loop_mod._extend_steps(0.0005, 2.0, 500_000, 500) == 500
+    assert loop_mod._extend_steps(-1.0, 2.0, 500_000, 500) == 500
+    assert loop_mod._extend_steps(1.0, 2.0, 500_000, 500) == 500_000
+
+
+def test_an_opening_round_shorter_than_a_frame_is_refused_before_any_md(
+    tmp_path: Path,
+) -> None:
+    adapter = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    with pytest.raises(ValueError, match="initial_steps=10 is shorter"):
+        run_campaign(
+            work_dir=tmp_path, adapter=adapter,
+            initial_steps=10, report_interval_steps=50, seed=42, equilibration_steps=0,
+        )
+
+    assert adapter.run_calls == []
+    assert not adapter.started
+
+
+def test_a_budget_remainder_shorter_than_a_frame_ends_the_campaign(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _stub_collaborators(monkeypatch, [_switch(), _extend(), _extend()])
+    biased: list[_FakeAdapter] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        a = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+        biased.append(a)
+        return a
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=10,
+        # ~135 steps: 100 for the opening biased round, then under one
+        # 50-step frame left — not worth a round that cannot be diagnosed.
+        max_biased_ns=0.00027,
+        **_run_kwargs(),
+    )
+
+    assert result.stop_reason == "biased_budget_exhausted"
+    assert biased[0].run_calls == [100]
+
+
+# ---------- provenance across a CV switch ----------
+
+def test_each_biased_round_keeps_the_plumed_dat_it_ran_under(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every pivot rewrites the one live plumed.dat, so after a `switch_cv`
+    the rows for the earlier biased rounds pointed at a file describing a CV
+    they never ran on. The snapshot beside the checkpoint is the record."""
+    _stub_collaborators(monkeypatch, [_switch(), _switch_cv(), _extend(), _stop()])
+
+    def labelled_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
+        return f"# bias on {proposal.label}\n"
+
+    monkeypatch.setattr(loop_mod, "_build_plumed_input", labelled_build)
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=6,
+        **_run_kwargs(),
+    )
+
+    rounds = tmp_path / "rounds"
+    first, replacement = _proposal().label, _replacement().label
+    assert not (rounds / "round_001.plumed.dat").exists()          # vanilla
+    assert (rounds / "round_002.plumed.dat").read_text() == f"# bias on {first}\n"
+    assert (rounds / "round_003.plumed.dat").read_text() == f"# bias on {replacement}\n"
+    # The live file now describes the replacement — which is why the
+    # snapshot has to exist for round 2 to be readable afterwards.
+    assert (tmp_path / "plumed.dat").read_text() == f"# bias on {replacement}\n"
+
+
+# ---------- wall notes across a crash at the pivot ----------
+
+def test_wall_notes_lost_to_a_crash_are_written_on_the_pivot_resume(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The live pivot writes its wall notes after `append_round`; a crash
+    between the two left the F6/F11 warnings off the ledger for good, because
+    the resume branches rebuilt the bias without collecting them. They are
+    re-derived on resume, and the ones the live run did get written are not
+    written twice."""
+    store.init_campaign(tmp_path, _full_config(tmp_path))
+    store.append_round(
+        tmp_path, round_index=1, n_steps=100,
+        dcd_path=tmp_path / "rounds/round_001.dcd",
+        checkpoint_path=tmp_path / "rounds/round_001.chk",
+        report=dict(_REPORT), decision="switch_to_metad", reason="pinned",
+        extra_ns=None, metad_proposal=_proposal().to_dict(),
+    )
+    store.append_ledger_note(tmp_path, round_index=1, text="WARNING: already on record")
+
+    _stub_collaborators(monkeypatch, [_stop()])
+
+    def noting_build(proposal, traj, top, output_dir, *, notes=None, **kwargs):  # noqa: ANN001
+        if notes is not None:
+            notes.extend(["WARNING: already on record", "WARNING: wall beyond the box"])
+        return "PLUMED-TEXT\n"
+
+    monkeypatch.setattr(loop_mod, "_build_plumed_input", noting_build)
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    texts = [n.text for n in store.list_ledger_notes(tmp_path) if n.round_index == 1]
+    assert texts == ["WARNING: already on record", "WARNING: wall beyond the box"]

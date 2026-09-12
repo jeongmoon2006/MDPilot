@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,7 +49,12 @@ from mdpilot.diagnostics.report import make_report
 from mdpilot import preflight
 from mdpilot.observables import ObservableSpec, campaign_observable
 from mdpilot.memory import store
-from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
+from mdpilot.orchestrator.scientist import (
+    Decision,
+    MetadProposal,
+    UnresolvableProposal,
+    decide,
+)
 from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 
@@ -181,8 +187,10 @@ def run_campaign(
     `max_biased_ns` caps *cumulative* simulation time in the metadynamics
     phase, counting across rounds and across resumes (it is recomputed from
     the persisted biased rounds, so a restart cannot reset the meter). The
-    round that would exceed it is shortened to land exactly on the budget and
-    the campaign then ends with `biased_budget_exhausted`. The vanilla phase
+    round that would exceed it is shortened to land on the budget and the
+    campaign then ends with `biased_budget_exhausted`; a remainder shorter than
+    one trajectory frame is not run, since it could produce nothing to
+    diagnose. The vanilla phase
     is not counted. Left at None the biased phase is bounded only by
     `max_rounds`. A compute budget stated only in `task_expectation` is
     advisory — the model can read it and still ask for more — so anything
@@ -250,6 +258,17 @@ def run_campaign(
                 f"`count_recrossings` silently returns 0 for an inverted band, "
                 f"so a swapped pair would read as a run that never crossed."
             )
+
+    # A round shorter than one frame interval writes no frames — a 0-byte DCD
+    # mdtraj cannot open — so it would be paid for and then fail to be
+    # diagnosed. Extend rounds are floored in `_extend_steps`; the opening
+    # round is the caller's number, so it is checked here, before any MD.
+    if initial_steps < report_interval_steps:
+        raise ValueError(
+            f"run_campaign: initial_steps={initial_steps} is shorter than "
+            f"report_interval_steps={report_interval_steps}, so the opening "
+            f"round would write no trajectory frames and could not be diagnosed."
+        )
 
     work_dir = Path(work_dir)
     rounds_dir = work_dir / "rounds"
@@ -367,6 +386,12 @@ def run_campaign(
         first_value=float(first_value[0]),
         state_thresholds=list(state_thresholds) if state_thresholds else None,
     )
+    # Every CV proposal is resolved against this same structure the moment it
+    # arrives, so a selection the topology cannot resolve goes back to the
+    # model rather than being committed as a switch nothing can build.
+    validate_proposal = _proposal_validator(reference)
+
+    ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
 
     in_metad = False
     current_plumed_dat: Path | None = None
@@ -387,6 +412,7 @@ def run_campaign(
                 f"round {last.round_index} decided switch_to_metad but stored "
                 f"no metad_proposal; cannot build the bias"
             )
+        wall_notes: list[str] = []
         adapter = _pivot_to_metad(
             MetadProposal.from_dict(last.metad_proposal),
             source_trajectory=last.dcd_path,
@@ -397,11 +423,18 @@ def run_campaign(
             cv_upper_wall_nm=cv_upper_wall_nm,
             bias_pace=bias_pace,
             bias_factor=bias_factor,
+            notes=wall_notes,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
         start_round = last.round_index + 1
         n_steps = initial_steps
+        # The live pivot writes these *after* `append_round`, so a crash
+        # between the two loses them. Re-derived here; skipped for any the
+        # live run did get written, since the ledger is append-only.
+        _record_notes(
+            work_dir, ledger_notes, last.round_index, wall_notes, skip_existing=True
+        )
     elif last.decision == "switch_cv":
         # CV-revision resume. Ordered *before* the generic biased branch below:
         # a switch_cv round is itself biased, so `plumed_dat_path is not None`
@@ -413,6 +446,7 @@ def run_campaign(
                 f"metad_proposal; cannot build the replacement bias"
             )
         _clear_bias_state(plumed_dat_path.parent)
+        wall_notes: list[str] = []
         adapter = _pivot_to_metad(
             MetadProposal.from_dict(last.metad_proposal),
             source_trajectory=last.dcd_path,
@@ -423,11 +457,18 @@ def run_campaign(
             cv_upper_wall_nm=cv_upper_wall_nm,
             bias_pace=bias_pace,
             bias_factor=bias_factor,
+            notes=wall_notes,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
         start_round = last.round_index + 1
         n_steps = initial_steps
+        # The live pivot writes these *after* `append_round`, so a crash
+        # between the two loses them. Re-derived here; skipped for any the
+        # live run did get written, since the ledger is append-only.
+        _record_notes(
+            work_dir, ledger_notes, last.round_index, wall_notes, skip_existing=True
+        )
     elif last.plumed_dat_path is not None:
         # Mid-metaD-phase resume: rebuild the biased adapter from the persisted
         # plumed.dat and continue from that round's (biased) checkpoint. The
@@ -447,13 +488,17 @@ def run_campaign(
         in_metad = True
         current_plumed_dat = last.plumed_dat_path
         start_round = last.round_index + 1
-        n_steps = _extend_steps(last.extra_ns, max_extra_ns, steps_per_ns)
+        n_steps = _extend_steps(
+            last.extra_ns, max_extra_ns, steps_per_ns, report_interval_steps
+        )
     else:
         # Vanilla resume.
         _require_checkpoint(last)
         adapter.load_checkpoint(last.checkpoint_path)  # type: ignore[arg-type]
         start_round = last.round_index + 1
-        n_steps = _extend_steps(last.extra_ns, max_extra_ns, steps_per_ns)
+        n_steps = _extend_steps(
+            last.extra_ns, max_extra_ns, steps_per_ns, report_interval_steps
+        )
 
     # Cumulative biased steps already spent, so a resume continues the meter
     # rather than restarting it.
@@ -466,8 +511,6 @@ def run_campaign(
     biased_step_budget = (
         int(max_biased_ns * steps_per_ns) if max_biased_ns is not None else None
     )
-
-    ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
 
     _emit(
         on_event,
@@ -488,7 +531,9 @@ def run_campaign(
     for round_idx in range(start_round, max_rounds + 1):
         if in_metad and biased_step_budget is not None:
             remaining = biased_step_budget - biased_steps_run
-            if remaining <= 0:
+            if remaining < report_interval_steps:
+                # Spent, or less than one trajectory frame left — see the
+                # `initial_steps` guard above for why that is not worth running.
                 return _finish(on_event, work_dir, rounds, "biased_budget_exhausted")
             # Shorten the round that would overshoot rather than skipping it —
             # a partial round still deposits hills and still gets diagnosed.
@@ -539,27 +584,33 @@ def run_campaign(
         )
         _emit(on_event, "report", round_index=round_idx, report=report)
         prior_summaries = [_compact_prior(r) for r in rounds]
-        decision = decide(
-            report,
-            prior_round_summaries=prior_summaries,
-            hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
-            task_expectation=task_expectation,
-            phase="metad" if in_metad else "vanilla",
-            allow_cv_switch=in_metad and cv_switches_used < max_cv_switches,
-        )
-
         override_note: str | None = None
+        try:
+            decision = decide(
+                report,
+                prior_round_summaries=prior_summaries,
+                hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
+                task_expectation=task_expectation,
+                phase="metad" if in_metad else "vanilla",
+                allow_cv_switch=in_metad and cv_switches_used < max_cv_switches,
+                max_extra_ns=max_extra_ns,
+                validate_proposal=validate_proposal,
+            )
+        except UnresolvableProposal as refused:
+            decision, override_note = _refuse_unresolvable_proposal(refused)
+
         if in_metad:
             remaining = (
                 biased_step_budget - biased_steps_run
                 if biased_step_budget is not None
                 else None
             )
-            decision, override_note = _refuse_premature_stop(
-                decision, report, remaining
-            )
-            if override_note:
-                _emit(on_event, "override", round_index=round_idx, note=override_note)
+            # At most one of the two fires: a refused proposal is already an
+            # extend, and only a `stop` can be premature.
+            decision, stop_note = _refuse_premature_stop(decision, report, remaining)
+            override_note = override_note or stop_note
+        if override_note:
+            _emit(on_event, "override", round_index=round_idx, note=override_note)
 
         _emit(
             on_event, "decision",
@@ -628,11 +679,7 @@ def run_campaign(
             in_metad = True
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
-            for note in wall_notes:
-                store.append_ledger_note(work_dir, round_index=round_idx, text=note)
-                ledger_notes.append(
-                    store.LedgerNote(round_index=round_idx, text=note)
-                )
+            _record_notes(work_dir, ledger_notes, round_idx, wall_notes)
             _emit(
                 on_event, "pivot",
                 round_index=round_idx, kind="switch_to_metad",
@@ -664,11 +711,7 @@ def run_campaign(
             cv_switches_used += 1
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
-            for note in wall_notes:
-                store.append_ledger_note(work_dir, round_index=round_idx, text=note)
-                ledger_notes.append(
-                    store.LedgerNote(round_index=round_idx, text=note)
-                )
+            _record_notes(work_dir, ledger_notes, round_idx, wall_notes)
             _emit(
                 on_event, "pivot",
                 round_index=round_idx, kind="switch_cv",
@@ -677,7 +720,9 @@ def run_campaign(
             )
             continue
 
-        n_steps = _extend_steps(decision.extra_ns, max_extra_ns, steps_per_ns)
+        n_steps = _extend_steps(
+            decision.extra_ns, max_extra_ns, steps_per_ns, report_interval_steps
+        )
 
     return _finish(on_event, work_dir, rounds, "max_rounds_reached")
 
@@ -745,9 +790,12 @@ def _default_biased_factory(
 
 
 # HILLS and COLVAR are to a biased round what the checkpoint is to a vanilla
-# one: the state needed to continue. They are snapshotted together and restored
-# together.
-_BIAS_STATE_FILES = (_HILLS_NAME, _COLVAR_NAME)
+# one: the state needed to continue. plumed.dat is the definition of the bias
+# they were deposited under — and the live copy is rewritten in place by every
+# pivot and CV switch, so without a per-round snapshot the rows for the rounds
+# before a `switch_cv` point at a file describing a coordinate they never ran
+# on. All three are snapshotted together and restored together.
+_BIAS_STATE_FILES = (_HILLS_NAME, _COLVAR_NAME, _PLUMED_DAT_NAME)
 
 
 def _snapshot_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> None:
@@ -994,16 +1042,109 @@ def _refuse_premature_stop(
     return replace(decision, decision="extend", extra_ns=decision.extra_ns or 0.5), note
 
 
+def _refuse_unresolvable_proposal(
+    refused: UnresolvableProposal,
+) -> tuple[Decision, str]:
+    """Convert a proposal the topology cannot resolve into an extend, on record.
+
+    `decide()` has already sent the resolution error back to the model
+    `refused.attempts` times. Raising here would lose the round's MD (nothing
+    is persisted yet) and, worse, restart would re-run it into the same
+    proposal. Extending keeps the campaign moving under its current
+    Hamiltonian and writes the refusal to the ledger so the next round proposes
+    with the error in front of it — the same shape as `_refuse_premature_stop`.
+    """
+    d = refused.decision
+    note = (
+        f"proposal refused: the scientist chose {d.decision} with a CV the "
+        f"campaign topology cannot resolve, {refused.attempts} time(s) running "
+        f"({refused.error}). Converted to an extend; it may propose again next "
+        f"round. Reason given was: {d.reason}"
+    )
+    return (
+        replace(d, decision="extend", extra_ns=d.extra_ns or 0.5, metad_proposal=None),
+        note,
+    )
+
+
+def _proposal_validator(reference: md.Trajectory) -> Callable[[MetadProposal], None]:
+    """Resolve a proposal against the campaign topology, before it is committed.
+
+    The same `design_cv` call the pivot makes, run on the proposal the moment
+    it arrives. Until now the first resolution happened inside
+    `_pivot_to_metad`, after `store.append_round` had recorded the switch: a
+    selection string the topology could not resolve raised there, and every
+    restart re-entered the pivot branch and raised again with `decide()` never
+    called — the campaign was unrecoverable without editing state.db. Raised
+    here, the error goes back to the model as a tool result and it proposes
+    again.
+
+    `rmsd` writes a reference PDB as a side effect of resolving; it goes to a
+    scratch directory so a rejected proposal leaves nothing in the campaign.
+    """
+
+    def validate(proposal: MetadProposal) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            design_cv(
+                CVProposal(
+                    cv_type=proposal.cv_type,
+                    selections=tuple(proposal.selections),
+                    label=proposal.label,
+                ),
+                reference.topology,
+                reference=reference,
+                output_dir=Path(scratch),
+            )
+
+    return validate
+
+
+def _record_notes(
+    work_dir: Path,
+    ledger_notes: list[store.LedgerNote],
+    round_index: int,
+    texts: list[str],
+    *,
+    skip_existing: bool = False,
+) -> None:
+    """Append notes to the ledger and to the copy the scientist is shown.
+
+    `skip_existing` is for the resume paths: a pivot re-entered after a crash
+    regenerates the wall notes the live run may already have written, and the
+    ledger is append-only, so this is what keeps it from saying the same thing
+    twice.
+    """
+    for text in texts:
+        if skip_existing and any(
+            n.round_index == round_index and n.text == text for n in ledger_notes
+        ):
+            continue
+        store.append_ledger_note(work_dir, round_index=round_index, text=text)
+        ledger_notes.append(store.LedgerNote(round_index=round_index, text=text))
+
+
 def _extend_steps(
-    extra_ns: float | None, max_extra_ns: float, steps_per_ns: int
+    extra_ns: float | None,
+    max_extra_ns: float,
+    steps_per_ns: int,
+    report_interval_steps: int,
 ) -> int:
     """Steps for an extend round, clamped to the caller's `max_extra_ns`.
 
     What SQLite stores is the model's raw request, so the clamp has to be
     re-applied on every read. Applying it only in the live loop made a resumed
     campaign run a longer round than the uninterrupted one would have.
+
+    Floored at one trajectory frame rather than one step. The reporter writes
+    a frame every `report_interval_steps`, so a shorter round produces a DCD
+    with no frames at all — a 0-byte file mdtraj cannot open — and the round
+    report raises after the MD is spent; restart then re-derives the same
+    length from the stored `extra_ns` and fails the same way. `extra_ns` has no
+    lower bound in the tool schema, so the floor lives here.
     """
-    return max(int(min(extra_ns or 0.5, max_extra_ns) * steps_per_ns), 1)
+    return max(
+        int(min(extra_ns or 0.5, max_extra_ns) * steps_per_ns), report_interval_steps
+    )
 
 
 def _pivot_to_metad(
@@ -1169,7 +1310,8 @@ def _row_to_result(row: store.RoundRow) -> RoundResult:
         report=row.report,
         decision=Decision(
             decision=cast(
-                Literal["extend", "stop", "switch_to_metad"], row.decision
+                Literal["extend", "stop", "switch_to_metad", "switch_cv"],
+                row.decision,
             ),
             reason=row.reason,
             extra_ns=row.extra_ns,

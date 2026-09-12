@@ -206,10 +206,10 @@ separate plan artifact yet.
 ## Tech choices
 
 - **LLM:** Claude via the Anthropic SDK
-- **MD engines:** OpenMM (direct), GROMACS (direct), MDCrow (delegation), DynaMate (delegation, optional)
+- **MD engines:** OpenMM (direct), GROMACS (direct). MDCrow delegation deferred indefinitely — D5.
 - **Memory:** SQLite + filesystem (start simple, swap later if justified)
 - **HPC:** Slurm-aware execution layer (Milestone 5)
-- **Analysis:** MDAnalysis, MDTraj
+- **Analysis:** MDTraj
 - **Enhanced sampling:** PLUMED
 
 ---

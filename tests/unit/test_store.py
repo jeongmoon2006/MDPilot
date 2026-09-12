@@ -550,3 +550,23 @@ def test_an_inferred_value_is_marked_as_inferred(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "min_recrossings: stored=1 (not recorded;" in message
     assert "seed: stored=42 requested=7" in message   # genuinely recorded, unmarked
+
+
+def test_a_numpy_scalar_in_a_report_is_stored_as_a_plain_number(tmp_path: Path) -> None:
+    """The loop's per-round JSON writer tolerated numpy scalars and ran first;
+    this insert did not and ran second, so one uncast value wrote the JSON
+    file and then killed the campaign with the round's MD already spent."""
+    import numpy as np
+
+    store.init_campaign(tmp_path, _config())
+    store.append_round(
+        tmp_path, round_index=1, n_steps=10, dcd_path=tmp_path / "r.dcd",
+        checkpoint_path=None,
+        report={"mean": np.float64(1.5), "n_frames": np.int64(3)},
+        decision="extend", reason="r", extra_ns=0.5,
+    )
+
+    report = store.list_rounds(tmp_path)[0].report
+    assert report == {"mean": 1.5, "n_frames": 3}
+    assert type(report["mean"]) is float
+    assert type(report["n_frames"]) is int

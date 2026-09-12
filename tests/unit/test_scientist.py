@@ -12,7 +12,12 @@ from typing import Any, get_args, get_type_hints
 
 import pytest
 
-from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
+from mdpilot.orchestrator.scientist import (
+    Decision,
+    MetadProposal,
+    UnresolvableProposal,
+    decide,
+)
 
 
 class _FakeClient:
@@ -580,3 +585,117 @@ def test_every_non_extending_action_is_told_to_null_extra_ns() -> None:
             if action == "extend":
                 continue
             assert f"`{action}`" in rule, (kwargs, action, rule)
+
+
+# ---------- a proposal the topology cannot resolve goes back to the model ----------
+
+class _SequenceClient:
+    """Replays one tool_use response per call and keeps every request."""
+
+    def __init__(self, tool_inputs: list[dict[str, Any]]) -> None:
+        self._inputs = list(tool_inputs)
+        self.requests: list[dict[str, Any]] = []
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        block = SimpleNamespace(
+            type="tool_use", name="record_decision",
+            id=f"toolu_{len(self.requests)}", input=self._inputs.pop(0),
+        )
+        return SimpleNamespace(content=[block], stop_reason="tool_use")
+
+
+def _switch_input(selection: str) -> dict[str, Any]:
+    return {
+        "decision": "switch_to_metad", "reason": "pinned", "extra_ns": None,
+        "ledger_note": None,
+        "metad_proposal": {"cv_type": "gyration", "selections": [selection], "label": "rg"},
+    }
+
+
+def test_a_refused_proposal_is_sent_back_as_a_tool_error_and_retried() -> None:
+    """The resolution error is the feedback: it names the selection and the
+    failure, which is a better signal than any rubric. Same mechanism as
+    `setup_agent.propose_task_file`."""
+    fake = _SequenceClient([_switch_input("name CB"), _switch_input("name CA")])
+
+    def validate(proposal: MetadProposal) -> None:
+        if proposal.selections == ("name CB",):
+            raise ValueError("cv_designer: selection 'name CB' resolved to 0 atoms")
+
+    result = decide(
+        {"stub": True}, task_expectation="fold it", client=fake,
+        validate_proposal=validate,
+    )
+
+    assert result.metad_proposal is not None
+    assert result.metad_proposal.selections == ("name CA",)
+    assert len(fake.requests) == 2
+    retry = fake.requests[1]["messages"]
+    assert [m["role"] for m in retry] == ["user", "assistant", "user"]
+    feedback = retry[2]["content"][0]
+    assert feedback["type"] == "tool_result"
+    assert feedback["is_error"] is True
+    assert feedback["tool_use_id"] == "toolu_1"      # addressed at the refused call
+    assert "resolved to 0 atoms" in feedback["content"]
+
+
+def test_a_proposal_that_never_resolves_raises_with_what_was_asked_for() -> None:
+    fake = _SequenceClient([_switch_input("name CB")] * 3)
+
+    def validate(proposal: MetadProposal) -> None:
+        raise ValueError("cv_designer: selection 'name CB' resolved to 0 atoms")
+
+    with pytest.raises(UnresolvableProposal) as info:
+        decide(
+            {"stub": True}, task_expectation="fold it", client=fake,
+            validate_proposal=validate, max_attempts=3,
+        )
+
+    assert len(fake.requests) == 3
+    assert info.value.attempts == 3
+    assert "resolved to 0 atoms" in info.value.error
+    assert info.value.decision.decision == "switch_to_metad"
+
+
+def test_validation_is_not_run_when_nothing_is_proposed() -> None:
+    seen: list[MetadProposal] = []
+    fake = _SequenceClient([{"decision": "extend", "reason": "r", "extra_ns": 0.5}])
+
+    decide({"stub": True}, client=fake, validate_proposal=seen.append)
+
+    assert seen == []
+    assert len(fake.requests) == 1
+
+
+def test_each_proposal_carrying_tool_names_its_own_action() -> None:
+    """The biased switch tool reused the vanilla proposal schema verbatim, so
+    its description told the model the field was non-null iff the decision was
+    `switch_to_metad` — inside a tool whose enum has no such action. A model
+    that follows the schema over the prose emits null with `switch_cv`, and
+    the parser rejects that after the round's MD is spent."""
+    from mdpilot.orchestrator.scientist import _DECISION_TOOL, _METAD_SWITCH_TOOL
+
+    for tool, action, other in (
+        (_DECISION_TOOL, "switch_to_metad", "switch_cv"),
+        (_METAD_SWITCH_TOOL, "switch_cv", "switch_to_metad"),
+    ):
+        props = tool["input_schema"]["properties"]
+        assert action in props["decision"]["enum"]
+        description = props["metad_proposal"]["description"]
+        assert f"'{action}'" in description, description
+        assert other not in description, description
+
+
+def test_the_extension_ceiling_reaches_the_model() -> None:
+    """The prompt used to state a fixed 2.0 ns ceiling while the loop clamped
+    to whatever the caller passed, so the persisted `reason` could name a round
+    length that never ran."""
+    fake = _stub()
+    decide({"stub": True}, client=fake, max_extra_ns=0.75)
+
+    assert fake.last_request is not None
+    assert '"max_extra_ns": 0.75' in fake.last_request["messages"][0]["content"]
+    rule = _paragraph_containing(_system_text(fake), "`max_extra_ns`")
+    assert "ceiling" in rule.lower()

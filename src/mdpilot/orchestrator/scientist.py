@@ -70,7 +70,7 @@ import json
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import anthropic
 from dotenv import load_dotenv
@@ -79,6 +79,9 @@ load_dotenv()
 
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 2048
+# How many times a CV proposal the topology cannot resolve is sent back to the
+# model before `decide()` gives up. Same shape as `setup_agent._MAX_ATTEMPTS`.
+_MAX_PROPOSAL_ATTEMPTS = 3
 
 # --- Prompt knowledge base -------------------------------------------------
 #
@@ -312,7 +315,19 @@ _METAD_SWITCH_TOOL = {
                 "enum": ["extend", "stop", "switch_cv"],
                 "description": "What to do next with the biased run.",
             },
-            "metad_proposal": _METAD_PROPOSAL_SCHEMA,
+            # Same shape as the vanilla proposal, but the description has to
+            # name *this* tool's proposal action. Reused verbatim, it told the
+            # model the field was "non-null iff decision is 'switch_to_metad'"
+            # inside a tool whose enum has no such action — and a model that
+            # follows the schema over the prose emits null with `switch_cv`,
+            # which the parser rejects after the round's MD is already spent.
+            "metad_proposal": {
+                **_METAD_PROPOSAL_SCHEMA,
+                "description": (
+                    "Structured CV proposal. Non-null iff decision is "
+                    "'switch_cv'; null otherwise."
+                ),
+            },
         },
         "required": [
             *_METAD_DECISION_TOOL["input_schema"]["required"],
@@ -401,6 +416,24 @@ class Decision:
     metad_proposal: MetadProposal | None = None
 
 
+class UnresolvableProposal(RuntimeError):
+    """Every attempt produced a CV proposal the campaign topology cannot resolve.
+
+    Carries the last decision and the last resolution error so the caller can
+    record what was asked for and why it was refused, rather than only that
+    the call failed.
+    """
+
+    def __init__(self, decision: Decision, error: str, attempts: int) -> None:
+        super().__init__(
+            f"scientist: no resolvable CV proposal after {attempts} attempt(s); "
+            f"last error: {error}"
+        )
+        self.decision = decision
+        self.error = error
+        self.attempts = attempts
+
+
 def decide(
     diagnostic_report: dict[str, Any],
     *,
@@ -409,6 +442,9 @@ def decide(
     task_expectation: str | None = None,
     phase: Phase = "vanilla",
     allow_cv_switch: bool = False,
+    max_extra_ns: float | None = None,
+    validate_proposal: Callable[[MetadProposal], None] | None = None,
+    max_attempts: int = _MAX_PROPOSAL_ATTEMPTS,
     client: anthropic.Anthropic | None = None,
     model: str = _MODEL,
 ) -> Decision:
@@ -430,6 +466,21 @@ def decide(
     owns that budget: once the campaign has spent its allowance the action is
     dropped from the enum rather than refused after the fact, so the model
     never emits a decision the loop will not honour.
+
+    `max_extra_ns` is the ceiling the loop clamps an extend request to. Shown
+    to the model because the prompt used to state a fixed one: with a smaller
+    ceiling the model asked for the prompt's number, the round ran the loop's,
+    and the `reason` persisted as the campaign record named a length that was
+    never run.
+
+    `validate_proposal` is called on every proposal before it is returned. It
+    raises `ValueError` for one the caller cannot honour — the loop passes the
+    same `design_cv` resolution the pivot performs, so a selection string the
+    topology cannot resolve is caught here rather than after the round has
+    been committed with a switch nothing can build. The error text goes back
+    to the model as an `is_error` tool result and it proposes again, up to
+    `max_attempts` times; then `UnresolvableProposal` is raised carrying the
+    last decision and error. Same mechanism as `setup_agent.propose_task_file`.
     """
     client = client or anthropic.Anthropic()
     if phase not in _TOOL_FOR_PHASE:
@@ -457,30 +508,71 @@ def decide(
         "hypothesis_ledger": hypothesis_ledger or [],
         "prior_round_summaries": prior_round_summaries or [],
         "task_expectation": task_expectation,
+        "max_extra_ns": max_extra_ns,
     }
     user_message = (
         "Decide what to do next, given this round's state.\n\n"
         + json.dumps(payload, indent=2, sort_keys=True)
     )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=_MAX_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "record_decision"},
-        messages=[{"role": "user", "content": user_message}],
-    )
+    last_decision: Decision | None = None
+    last_error: str | None = None
+    for _ in range(max_attempts):
+        response = client.messages.create(
+            model=model,
+            max_tokens=_MAX_TOKENS,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=[tool],
+            tool_choice={"type": "tool", "name": "record_decision"},
+            messages=messages,
+        )
+        block = _tool_block(response)
+        decision = _parse_decision(block.input)
+        if validate_proposal is None or decision.metad_proposal is None:
+            return decision
+        try:
+            validate_proposal(decision.metad_proposal)
+        except ValueError as e:
+            last_decision, last_error = decision, str(e)
+            # Answered as a `tool_result`, not a bare user turn: the API
+            # rejects an assistant `tool_use` not followed by its result.
+            messages += [
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "is_error": True,
+                            "content": (
+                                "The CV proposal cannot be resolved against the "
+                                "campaign topology. Fix the selection(s) and "
+                                f"call the tool again.\n\n{last_error}"
+                            ),
+                        }
+                    ],
+                },
+            ]
+            continue
+        return decision
 
+    assert last_decision is not None and last_error is not None
+    raise UnresolvableProposal(last_decision, last_error, max_attempts)
+
+
+def _tool_block(response: Any) -> Any:
+    """The `record_decision` tool_use block, whole — a retry needs its `id`."""
     for block in response.content:
         if block.type == "tool_use" and block.name == "record_decision":
-            return _parse_decision(block.input)
+            return block
     raise RuntimeError(
         f"scientist: response contained no record_decision tool_use "
         f"(stop_reason={response.stop_reason})"

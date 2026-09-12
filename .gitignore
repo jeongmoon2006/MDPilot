@@ -75,6 +75,10 @@ make_ppt*.py
 build_deck*.py
 generate_slides*.py
 
+# Claude Code per-user settings. The `.local.json` suffix is the untracked
+# convention: it carries this machine's paths and permission allowlist.
+.claude/settings.local.json
+
 # IDE - VSCode
 .vscode/*
 !.vscode/settings.json

@@ -15,8 +15,11 @@ sampling freely. Do not ask for those numbers or reason as if you had them.
 Report fields, all derived from the deposited bias (HILLS) integrated into a
 free-energy surface:
 
-- `fes_drift_kj_per_mol` — how much the surface changed between the last two
-cumulative estimates. The standard well-tempered convergence test.
+- `fes_drift_kj_per_mol` — how much the surface changed between the half-way
+cumulative estimate and the latest one. The standard well-tempered
+convergence test, taken over a gap long enough to move: consecutive estimates
+are a fraction of a percent of the run apart and barely differ however
+unconverged the surface is.
 - `recrossings` — barrier crossings, counted with hysteresis between
 `recrossing_low` and `recrossing_high`. `barrier_crossed` is `recrossings >=
 1`. `recrossing_basis` says what those boundaries are:
@@ -32,7 +35,9 @@ round; compare the boundaries against your task's states before reading it.
 crossings. Do not treat a null as evidence the walker stayed put — check
 `cv_min`/`cv_max` against `cv_start` to see how far it has actually moved.
 - `fes_converged` — true only when drift is below kT (≈2.5 kJ/mol at 300 K)
-AND `recrossings >= 1`. Low drift *alone* is not convergence: a walker that
+AND `recrossings >= min_recrossings`, which the report states alongside it: 1
+accepts a one-way crossing, 2 requires a full round trip so the reverse
+barrier is sampled too. Low drift *alone* is not convergence: a walker that
 never left its starting basin produces a surface that stops changing
 immediately, because nothing new is being sampled.
 - `observable_min_this_round` / `observable_max_this_round` — the range the
@@ -53,7 +58,7 @@ measured over that range only, not over the wider grid `sum_hills` writes.
 Decision rule:
 
 - `fes_converged=true` → `stop`. The surface has stopped moving and the walker
-has crossed the barrier at least once.
+has made the number of transitions the task requires.
 - otherwise → `extend`. This includes `fes_converged=null` (not enough
 estimates or no COLVAR yet) and the low-drift/zero-recrossing case, which is
 an under-filled basin, not a converged surface.
