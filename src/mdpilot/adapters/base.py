@@ -23,6 +23,14 @@ Lifecycle:
 The topology written by `start()` and any trajectories written by
 `run_steps()` must be loadable by mdtraj — diagnostics live one level up
 and don't care which engine produced them.
+
+Optional extension, not part of the Protocol: `export_state_xml()` /
+`load_state_xml(xml)`. A checkpoint is bound to its System and cannot cross
+a change of bias; an engine that can hand the walker's positions and
+velocities across as a portable object lets the loop warm-start a pivot or a
+CV revision from where the walker is rather than from the cached start. The
+loop uses it when the adapter offers it (`OpenMMAdapter` does) and falls
+back to the cache otherwise.
 """
 
 from __future__ import annotations

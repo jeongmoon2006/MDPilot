@@ -365,7 +365,7 @@ def test_switch_enabled_biased_tool_requires_a_proposal_slot() -> None:
     from mdpilot.orchestrator.scientist import _METAD_SWITCH_TOOL
 
     schema = _METAD_SWITCH_TOOL["input_schema"]
-    assert schema["properties"]["decision"]["enum"] == ["extend", "stop", "switch_cv"]
+    assert schema["properties"]["decision"]["enum"] == ["extend", "stop", "switch_cv", "add_cv"]
     # strict mode requires every property to be listed as required; the
     # nullable type is what makes "no proposal this round" expressible.
     assert "metad_proposal" in schema["required"]
@@ -789,3 +789,39 @@ def test_the_citation_rule_is_in_every_prompt() -> None:
         decide({"stub": True}, client=fake, **kwargs)
         rule = _paragraph_containing(_system_text(fake), "For `cited`")
         assert "checked" in rule
+
+
+# ---------- add_cv: escalate to several coordinates at once ----------
+
+def test_add_cv_is_offered_with_switch_cv_and_carries_a_proposal() -> None:
+    from mdpilot.orchestrator.scientist import _METAD_DECISION_TOOL, _METAD_SWITCH_TOOL
+
+    assert "add_cv" in _METAD_SWITCH_TOOL["input_schema"]["properties"]["decision"]["enum"]
+    assert "add_cv" not in _METAD_DECISION_TOOL["input_schema"]["properties"]["decision"]["enum"]
+    assert "'add_cv'" in _METAD_SWITCH_TOOL["input_schema"]["properties"]["metad_proposal"]["description"]
+
+    fake = _SequenceClient([{
+        "decision": "add_cv", "reason": "cannot return", "extra_ns": None, "ledger_note": None,
+        "metad_proposal": {"cv_type": "torsion",
+                           "selections": ["resSeq 4 and name N", "resSeq 4 and name CA",
+                                          "resSeq 4 and name C", "resSeq 5 and name N"],
+                           "label": "psi_turn"},
+    }])
+    result = decide({"stub": True}, phase="metad", allow_cv_switch=True, client=fake)
+    assert result.decision == "add_cv" and result.metad_proposal.label == "psi_turn"
+
+    with pytest.raises(RuntimeError, match="metad_proposal is null"):
+        decide({"stub": True}, phase="metad", allow_cv_switch=True, client=_SequenceClient([
+            {"decision": "add_cv", "reason": "r", "extra_ns": None, "ledger_note": None,
+             "metad_proposal": None}]))
+
+
+def test_the_add_cv_guidance_travels_with_the_switch_guidance() -> None:
+    fake = _stub()
+    decide({"stub": True}, phase="metad", allow_cv_switch=True, client=fake)
+    text = _system_text(fake)
+    assert "Action `add_cv`" in text and "Action `switch_cv`" in text
+
+    fake = _stub()
+    decide({"stub": True}, phase="metad", allow_cv_switch=False, client=fake)
+    assert "Action `add_cv`" not in _system_text(fake)

@@ -50,6 +50,12 @@ ever made long after the walker stopped moving. If the per-round range has
 collapsed into one state while `fes_depth_kj_per_mol` keeps growing, the bias
 is filling a basin the coordinate cannot lead the system out of: say so in
 `reason` and record it in `ledger_note`.
+- `biased_cvs` — the coordinate(s) currently biased. One until you escalate;
+after `add_cv` several are biased in parallel, and `cv_ranges` then gives the
+range each covered over the biased phase so far, so a coordinate that is not
+moving is visible as such. The surface fields above describe the *primary*
+coordinate: the campaign observable's own marginal when it is among the
+biased ones, otherwise the first.
 - `rounds_since_low_visited` / `rounds_since_high_visited` — consecutive
 rounds, counting this one, in which the walker never entered that state. 0
 means it was there this round. This is the trap seen from the other side:

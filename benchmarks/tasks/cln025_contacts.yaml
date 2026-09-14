@@ -79,7 +79,7 @@ sampling:
   # How many times the scientist may replace the biased coordinate. A contact
   # count cannot lead a disordered chain back to folded (F13), so one revision
   # is the escape hatch out of that trap.
-  max_cv_switches: 1
+  max_cv_switches: 2   # replace the coordinate, or add one and bias both
   # Insurance for that switch, not for the starting CV. `contacts` is bounded
   # and needs no wall, but the natural replacement is a length-dimensioned
   # coordinate — the model reaches for `rmsd` — and RMSD-to-native is unbounded

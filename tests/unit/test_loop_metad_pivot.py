@@ -56,6 +56,7 @@ class _FakeAdapter:
         self.run_calls: list[int] = []
         self.loaded: list[Path] = []
         self.started = False
+        self.state_loaded: str | None = None
         self._topology_path = self._work_dir / "topology.pdb"
 
     @property
@@ -100,6 +101,12 @@ class _FakeAdapter:
 
     def load_checkpoint(self, path: Path) -> None:
         self.loaded.append(Path(path))
+
+    def export_state_xml(self) -> str:
+        return f"STATE after {sum(self.run_calls)} steps"
+
+    def load_state_xml(self, xml: str) -> None:
+        self.state_loaded = xml
 
 
 _REPORT = {
@@ -149,10 +156,11 @@ def _stub_collaborators(monkeypatch, decisions: list[Decision]) -> dict:
 
     monkeypatch.setattr(loop_mod, "decide", fake_decide)
 
-    def fake_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
+    def fake_build(proposals, traj, top, output_dir, **kwargs):  # noqa: ANN001
         text = "PLUMED-TEXT\n"
         record["plumed_texts"].append(text)
-        record["cv_labels"].append(proposal.label)
+        record["cv_labels"].append(proposals[-1].label)
+        record.setdefault("cv_sets", []).append([p.label for p in proposals])
         return text
 
     monkeypatch.setattr(loop_mod, "_build_plumed_input", fake_build)
@@ -1029,7 +1037,8 @@ def test_biased_phase_uses_the_adapter_thermostat_temperature(
     record = _stub_collaborators(monkeypatch, [_switch(), _stop()])
     seen: dict = {}
 
-    def spy_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
+    def spy_build(proposals, traj, top, output_dir, **kwargs):  # noqa: ANN001
+        proposal = proposals[-1]
         seen["build"] = kwargs["temperature_k"]
         record["cv_labels"].append(proposal.label)
         return "PLUMED-TEXT\n"
@@ -1083,7 +1092,7 @@ def _render(tmp_path: Path, **overrides) -> str:
 
     dcd, pdb = _two_atom_traj(tmp_path)
     return _build_plumed_input(
-        MetadProposal(cv_type="distance", selections=("name A", "name B"), label="d"),
+        [MetadProposal(cv_type="distance", selections=("name A", "name B"), label="d")],
         dcd,
         pdb,
         tmp_path.resolve(),
@@ -1583,8 +1592,8 @@ def test_each_biased_round_keeps_the_plumed_dat_it_ran_under(
     they never ran on. The snapshot beside the checkpoint is the record."""
     _stub_collaborators(monkeypatch, [_switch(), _switch_cv(), _extend(), _stop()])
 
-    def labelled_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
-        return f"# bias on {proposal.label}\n"
+    def labelled_build(proposals, traj, top, output_dir, **kwargs):  # noqa: ANN001
+        return f"# bias on {proposals[-1].label}\n"
 
     monkeypatch.setattr(loop_mod, "_build_plumed_input", labelled_build)
 
@@ -1631,7 +1640,7 @@ def test_wall_notes_lost_to_a_crash_are_written_on_the_pivot_resume(
 
     _stub_collaborators(monkeypatch, [_stop()])
 
-    def noting_build(proposal, traj, top, output_dir, *, notes=None, **kwargs):  # noqa: ANN001
+    def noting_build(proposals, traj, top, output_dir, *, notes=None, **kwargs):  # noqa: ANN001
         if notes is not None:
             notes.extend(["WARNING: already on record", "WARNING: wall beyond the box"])
         return "PLUMED-TEXT\n"
@@ -1747,7 +1756,7 @@ def test_the_observable_is_printed_in_colvar_beside_the_biased_cv(tmp_path: Path
     traj, top = _two_atom_traj(tmp_path)
     biased = MetadProposal(cv_type="distance", selections=("index 0", "index 1"), label="d")
     text = loop_mod._build_plumed_input(
-        biased, traj, top, tmp_path, temperature_k=300.0,
+        [biased], traj, top, tmp_path, temperature_k=300.0,
         observable=ObservableSpec(cv_type="distance", selections=("index 0", "index 1"),
                                   name="d_nm"),
     )
@@ -1804,3 +1813,188 @@ def test_a_biased_round_reports_the_surface_on_the_observable(tmp_path: Path, mo
     assert surface.free_energy.min() == 0.0
     assert "delta_g_low_minus_high_kj_per_mol" in report
     written.update(report)
+
+
+# ---------- escalation: one coordinate, then several in parallel ----------
+
+def _added() -> MetadProposal:
+    return MetadProposal(cv_type="gyration", selections=("backbone",), label="rg_added")
+
+
+def _add_cv() -> Decision:
+    return Decision(
+        decision="add_cv", reason="crosses but cannot return", extra_ns=None,
+        metad_proposal=_added(),
+    )
+
+
+def test_active_cvs_replays_the_persisted_decisions() -> None:
+    def row(decision, proposal=None):
+        return store.RoundRow(
+            round_index=0, n_steps=1, dcd_path=Path("x"), checkpoint_path=None, report={},
+            decision=decision, reason="", extra_ns=None,
+            metad_proposal=proposal.to_dict() if proposal else None,
+        )
+    a, b, c, d = (MetadProposal("rmsd", ("name CA",), lbl) for lbl in ("a", "b", "c", "d"))
+    rows = [row("switch_to_metad", a), row("extend"), row("add_cv", b), row("extend"),
+            row("switch_cv", c), row("add_cv", d)]
+
+    assert [p.label for p in loop_mod._active_cvs(rows[:4])] == ["a", "b"]
+    assert [p.label for p in loop_mod._active_cvs(rows)] == ["c", "d"]
+    assert loop_mod._active_cvs([row("extend")]) == []
+
+
+def test_hills_files_follow_the_size_of_the_set() -> None:
+    one, two = _proposal(), _replacement()
+    assert loop_mod._hills_files([one]) == ["HILLS"]
+    assert loop_mod._hills_files([one, two]) == [f"HILLS.{one.label}", f"HILLS.{two.label}"]
+
+
+def test_the_primary_surface_is_the_observables_own_marginal_when_biased() -> None:
+    from mdpilot.observables import ObservableSpec
+
+    q = ObservableSpec.native_contact_fraction()
+    rmsd = MetadProposal("rmsd", ("name CA",), "rmsd_ca")
+    contacts = MetadProposal("contacts", ("name CA",), "q_biased")
+
+    assert loop_mod._primary_hills([rmsd], q) == "HILLS"
+    assert loop_mod._primary_hills([rmsd, contacts], q) == "HILLS.q_biased"
+    assert loop_mod._primary_hills([rmsd, _added()], q) == "HILLS.rmsd_ca"
+
+
+def test_add_cv_keeps_the_deposited_hills_and_biases_in_parallel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The first coordinate was insufficient, not wrong: its hills stay, moved
+    to the per-CV file PBMETAD reads, the new coordinate starts from nothing,
+    and RESTART is on so the retained hills are read back."""
+    record = _stub_collaborators(monkeypatch, [_switch(), _add_cv(), _extend(), _stop()])
+    events: list[tuple[str, dict]] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        # what PLUMED would leave behind while the single-CV bias ran
+        (tmp_path / "HILLS").write_text("#! FIELDS time rg\n0 1\n")
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    result = run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory, max_rounds=6,
+        on_event=lambda n, p: events.append((n, p)), **_run_kwargs(),
+    )
+
+    assert [r.decision.decision for r in result.rounds] == ["switch_to_metad", "add_cv", "extend", "stop"]
+    assert record["cv_sets"] == [[_proposal().label], [_proposal().label, _added().label]]
+    assert (tmp_path / f"HILLS.{_proposal().label}").exists()          # kept, renamed
+    assert (tmp_path / "plumed.dat").read_text().startswith("RESTART")  # read back
+    pivot = next(p for n, p in events if n == "pivot" and p["kind"] == "add_cv")
+    assert pivot["biased_cvs"] == [_proposal().label, _added().label]
+    # both revisions draw on one allowance
+    assert result.rounds[2].report["cv_switches_used"] == 1
+    assert result.rounds[1].report["cv_switches_remaining"] == 2 - 0
+
+
+def test_a_switch_after_an_add_drops_every_hills_file(tmp_path: Path, monkeypatch) -> None:
+    _stub_collaborators(monkeypatch, [_switch(), _add_cv(), _switch_cv(), _stop()])
+
+    built = 0
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        # What PLUMED leaves behind under each bias: `HILLS` under the first,
+        # single-CV bias; the added coordinate's file under the parallel one.
+        nonlocal built
+        built += 1
+        if built == 1:
+            (tmp_path / "HILLS").write_text("h\n")
+        elif built == 2:
+            (tmp_path / f"HILLS.{_added().label}").write_text("h\n")
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory, max_rounds=6, max_cv_switches=2, **_run_kwargs(),
+    )
+
+    # the factory re-creates `HILLS` at the final switch; nothing per-CV survives
+    assert not list(tmp_path.glob("HILLS.*"))
+    assert not (tmp_path / "plumed.dat").read_text().startswith("RESTART")
+
+
+def test_the_biased_set_is_capped_at_three(tmp_path: Path) -> None:
+    three = [MetadProposal("rmsd", ("name CA",), f"cv{i}") for i in range(3)]
+    with pytest.raises(ValueError, match="cap is three"):
+        loop_mod._revise_bias(
+            "add_cv", previous=three, proposal=_added(), source_trajectory=tmp_path / "x",
+            topology_path=tmp_path / "t.pdb", factory=lambda t: None,
+            plumed_dat_path=tmp_path / "plumed.dat", temperature_k=300.0,
+        )
+
+
+def test_a_revision_warm_starts_from_the_walkers_state(tmp_path: Path, monkeypatch) -> None:
+    """The new adapter is placed where the walker was when the revision was
+    decided, not at the cached start — that cost a campaign eight of eleven
+    nanoseconds re-unfolding a hairpin it had already unfolded."""
+    _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    biased: list[_FakeAdapter] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        a = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+        biased.append(a)
+        return a
+
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory, max_rounds=3, **_run_kwargs(),
+    )
+
+    assert biased[0].state_loaded == "STATE after 100 steps"     # the vanilla walker
+    assert (tmp_path / "rounds" / "round_001.state.xml").read_text() == "STATE after 100 steps"
+
+
+def test_a_revision_resumed_after_a_crash_warm_starts_from_the_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store.init_campaign(tmp_path, _full_config(tmp_path))
+    store.append_round(
+        tmp_path, round_index=1, n_steps=100, dcd_path=tmp_path / "rounds/round_001.dcd",
+        checkpoint_path=tmp_path / "rounds/round_001.chk", report=dict(_REPORT),
+        decision="switch_to_metad", reason="pinned", extra_ns=None,
+        metad_proposal=_proposal().to_dict(),
+    )
+    (tmp_path / "rounds").mkdir(exist_ok=True)
+    (tmp_path / "rounds" / "round_001.state.xml").write_text("STATE from the snapshot")
+    _stub_collaborators(monkeypatch, [_stop()])
+    biased: list[_FakeAdapter] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        a = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+        biased.append(a)
+        return a
+
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory, max_rounds=3, **_run_kwargs(),
+    )
+
+    assert biased[0].state_loaded == "STATE from the snapshot"
+
+
+def test_two_proposals_render_a_parallel_bias_with_grids(tmp_path: Path) -> None:
+    traj, top = _two_atom_traj(tmp_path)
+    d1 = MetadProposal(cv_type="distance", selections=("index 0", "index 1"), label="d1")
+    d2 = MetadProposal(cv_type="distance", selections=("index 1", "index 0"), label="d2")
+
+    text = loop_mod._build_plumed_input([d1, d2], traj, top, tmp_path, temperature_k=300.0)
+
+    line = next(ln for ln in text.splitlines() if "PBMETAD" in ln)
+    assert "ARG=d1,d2" in line
+    assert "GRID_MIN=-0.2,-0.2 GRID_MAX=2.5,2.5" in line
+    assert f"FILE={tmp_path.resolve() / 'HILLS.d1'},{tmp_path.resolve() / 'HILLS.d2'}" in line
+    assert "PRINT ARG=d1,d2,pb.bias" in text
+
+
+def test_a_torsion_in_the_set_gets_a_periodic_grid() -> None:
+    from mdpilot.adapters.plumed_writer import ContactsCV, RmsdCV, TorsionCV
+
+    assert loop_mod._grid_bounds(TorsionCV("t", (0, 1, 2, 3))) == ("-pi", "pi")
+    assert loop_mod._grid_bounds(ContactsCV("q", ((0, 1),), 0.75)) == (-0.3, 1.3)
+    assert loop_mod._grid_bounds(RmsdCV("r", (0, 1, 2), Path("/abs/r.pdb"))) == (-0.2, 2.5)

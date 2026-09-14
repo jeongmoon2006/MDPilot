@@ -42,7 +42,13 @@ import numpy as np
 
 from mdpilot.adapters.base import MDAdapter
 from mdpilot.adapters.openmm_adapter import OpenMMAdapter
-from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
+from mdpilot.adapters.plumed_writer import (
+    ContactsCV,
+    ParallelBias,
+    PlumedInput,
+    TorsionCV,
+    enable_restart,
+)
 from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.free_energy import (
     delta_g_kj_per_mol,
@@ -74,10 +80,13 @@ from mdpilot.sampling.cv_designer import CVProposal, design_cv
 _FS_PER_NS = 1_000_000.0
 _PLUMED_DAT_NAME = "plumed.dat"  # canonical bias artifact (the OpenMM adapter also writes here)
 # PLUMED's own outputs, alongside plumed.dat. These names must match the
-# defaults `_build_plumed_input` leaves on MetadynamicsBias.hills_file and
-# PlumedInput.colvar_file — they are what the rendered FILE= directives point at.
+# defaults `_build_plumed_input` leaves on MetadynamicsBias.hills_file /
+# ParallelBias.hills_prefix and PlumedInput.colvar_file — they are what the
+# rendered FILE= directives point at. One CV deposits into `HILLS`; a parallel
+# bias on several deposits into `HILLS.<label>`, one file per CV.
 _HILLS_NAME = "HILLS"
 _COLVAR_NAME = "COLVAR"
+_STATE_NAME = "state.xml"   # the walker's State, snapshotted beside each checkpoint
 
 StopReason = Literal[
     "scientist_said_stop",
@@ -150,7 +159,7 @@ def run_campaign(
     max_biased_ns: float | None = None,
     min_recrossings: int = 1,
     state_thresholds: tuple[float, float] | None = None,
-    max_cv_switches: int = 1,
+    max_cv_switches: int = 2,
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
     bias_factor: float | None = None,
@@ -180,11 +189,15 @@ def run_campaign(
     the coordinate the task defines its states on is comparable across rounds
     and across a change of biased CV.
 
-    `max_cv_switches` is how many times the scientist may replace the biased
-    CV within one campaign. While switches remain, `switch_cv` is offered in
-    the biased action space; once they are spent it is dropped from the tool
-    schema, so a further revision is unrepresentable rather than emitted and
-    then refused. Counted across resumes from the persisted rounds.
+    `max_cv_switches` is how many times the scientist may revise the biased
+    coordinates within one campaign — by replacing the set (`switch_cv`) or by
+    adding one coordinate and biasing all of them in parallel (`add_cv`, up
+    to three). The biased phase starts on one coordinate and escalates only
+    when the evidence says one cannot carry the transition. While revisions
+    remain both actions are offered in the biased action space; once spent
+    they are dropped from the tool schema, so a further revision is
+    unrepresentable rather than emitted and then refused. Counted across
+    resumes from the persisted rounds.
 
     `max_rounds`, `max_extra_ns`, `max_biased_ns` and `max_cv_switches` are
     loop-control bounds and may differ between invocations. Everything that
@@ -408,6 +421,8 @@ def run_campaign(
 
     in_metad = False
     current_plumed_dat: Path | None = None
+    # The coordinates currently biased, replayed from the persisted decisions.
+    active_cvs: list[MetadProposal] = _active_cvs(prior_rows)
     last = prior_rows[-1] if prior_rows else None
 
     if last is None:
@@ -415,19 +430,25 @@ def run_campaign(
             adapter.run_steps(equilibration_steps)
         start_round = 1
         n_steps = initial_steps
-    elif last.decision == "switch_to_metad":
-        # Pivot-resume: the metaD phase has produced no round yet. Rebuild the
-        # bias from the switch round's proposal + its (vanilla) trajectory and
-        # start a fresh biased simulation. The vanilla checkpoint is not loaded
-        # (not portable across the added PlumedForce).
+    elif last.decision in ("switch_to_metad", "switch_cv", "add_cv"):
+        # Revision-resume: the round that redefined the biased coordinates is
+        # persisted, but no round has run under the new bias yet. Rebuild it
+        # exactly as the live loop would have — from the proposal(s) and that
+        # round's trajectory — and warm-start from the walker's snapshotted
+        # State when there is one. Ordered *before* the generic biased branch
+        # below: a `switch_cv`/`add_cv` round is itself biased, so
+        # `plumed_dat_path is not None` would match first and resume on the
+        # coordinates the scientist just revised away from.
         if last.metad_proposal is None:
             raise RuntimeError(
-                f"round {last.round_index} decided switch_to_metad but stored "
+                f"round {last.round_index} decided {last.decision} but stored "
                 f"no metad_proposal; cannot build the bias"
             )
         wall_notes: list[str] = []
-        adapter = _pivot_to_metad(
-            MetadProposal.from_dict(last.metad_proposal),
+        adapter = _revise_bias(
+            last.decision,
+            previous=_active_cvs(prior_rows[:-1]),
+            proposal=MetadProposal.from_dict(last.metad_proposal),
             source_trajectory=last.dcd_path,
             topology_path=adapter.topology_path,
             factory=biased_adapter_factory,
@@ -437,48 +458,14 @@ def run_campaign(
             bias_pace=bias_pace,
             bias_factor=bias_factor,
             observable=observable,
+            warm_state=_read_state_snapshot(rounds_dir, last.round_index),
             notes=wall_notes,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
         start_round = last.round_index + 1
         n_steps = initial_steps
-        # The live pivot writes these *after* `append_round`, so a crash
-        # between the two loses them. Re-derived here; skipped for any the
-        # live run did get written, since the ledger is append-only.
-        _record_notes(
-            work_dir, ledger_notes, last.round_index, wall_notes, skip_existing=True
-        )
-    elif last.decision == "switch_cv":
-        # CV-revision resume. Ordered *before* the generic biased branch below:
-        # a switch_cv round is itself biased, so `plumed_dat_path is not None`
-        # would match first and resume the campaign on the CV the scientist
-        # just rejected, with RESTART reading its hills back.
-        if last.metad_proposal is None:
-            raise RuntimeError(
-                f"round {last.round_index} decided switch_cv but stored no "
-                f"metad_proposal; cannot build the replacement bias"
-            )
-        _clear_bias_state(plumed_dat_path.parent)
-        wall_notes: list[str] = []
-        adapter = _pivot_to_metad(
-            MetadProposal.from_dict(last.metad_proposal),
-            source_trajectory=last.dcd_path,
-            topology_path=adapter.topology_path,
-            factory=biased_adapter_factory,
-            plumed_dat_path=plumed_dat_path,
-            temperature_k=temperature_k,
-            cv_upper_wall_nm=cv_upper_wall_nm,
-            bias_pace=bias_pace,
-            bias_factor=bias_factor,
-            observable=observable,
-            notes=wall_notes,
-        )
-        in_metad = True
-        current_plumed_dat = plumed_dat_path
-        start_round = last.round_index + 1
-        n_steps = initial_steps
-        # The live pivot writes these *after* `append_round`, so a crash
+        # The live revision writes these *after* `append_round`, so a crash
         # between the two loses them. Re-derived here; skipped for any the
         # live run did get written, since the ledger is append-only.
         _record_notes(
@@ -491,7 +478,8 @@ def run_campaign(
         # snapshot paired with the checkpoint, then turn RESTART on so METAD
         # reads it back instead of backing it up and refilling from zero.
         _restore_bias_state(
-            last.plumed_dat_path.parent, rounds_dir, last.round_index
+            last.plumed_dat_path.parent, rounds_dir, last.round_index,
+            _bias_state_files(active_cvs),
         )
         adapter = biased_adapter_factory(
             enable_restart(last.plumed_dat_path.read_text())
@@ -522,7 +510,9 @@ def run_campaign(
     )
     # Same reasoning as the biased-step meter: recomputed from disk so a
     # restart cannot buy the scientist a second allowance of CV switches.
-    cv_switches_used = sum(1 for r in prior_rows if r.decision == "switch_cv")
+    cv_switches_used = sum(
+        1 for r in prior_rows if r.decision in ("switch_cv", "add_cv")
+    )
     biased_step_budget = (
         int(max_biased_ns * steps_per_ns) if max_biased_ns is not None else None
     )
@@ -579,9 +569,11 @@ def run_campaign(
         # checkpoint, restart has no resume point and re-runs the round. A
         # checkpoint with no matching row is the documented harmless case (D4).
         ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
+        _write_state_snapshot(adapter, rounds_dir, round_idx)
         if current_plumed_dat is not None:
             _snapshot_bias_state(
-                current_plumed_dat.parent, rounds_dir, round_idx
+                current_plumed_dat.parent, rounds_dir, round_idx,
+                _bias_state_files(active_cvs),
             )
         report = _round_report(
             dcd,
@@ -596,6 +588,7 @@ def run_campaign(
             observable=observable,
             cv_switches_used=cv_switches_used,
             max_cv_switches=max_cv_switches,
+            active_cvs=active_cvs,
         )
         _emit(on_event, "report", round_index=round_idx, report=report)
         prior_summaries = [_compact_prior(r) for r in rounds]
@@ -678,9 +671,20 @@ def run_campaign(
                     on_event, work_dir, rounds, "switch_to_metad_requested"
                 )
             assert decision.metad_proposal is not None  # guaranteed by the parser
+
+        if decision.decision in ("switch_to_metad", "switch_cv", "add_cv"):
+            assert decision.metad_proposal is not None  # guaranteed by the parser
             wall_notes: list[str] = []
-            adapter = _pivot_to_metad(
-                decision.metad_proposal,
+            # A replacement or added CV is sized on *this* round's trajectory,
+            # which for a revision was run under the outgoing bias. That spread
+            # is inflated by the bias that drove the walker across the old
+            # coordinate, which is what `_SIGMA_CEILINGS` in bias_designer
+            # exists to catch. The walker itself carries over: the new adapter
+            # warm-starts from this adapter's State rather than the cache.
+            adapter = _revise_bias(
+                decision.decision,
+                previous=active_cvs,
+                proposal=decision.metad_proposal,
                 source_trajectory=dcd,
                 topology_path=adapter.topology_path,
                 factory=biased_adapter_factory,
@@ -690,50 +694,22 @@ def run_campaign(
                 bias_pace=bias_pace,
                 bias_factor=bias_factor,
                 observable=observable,
+                warm_state=_export_state(adapter),
                 notes=wall_notes,
             )
+            active_cvs = _revised_cvs(decision.decision, active_cvs, decision.metad_proposal)
+            if decision.decision != "switch_to_metad":
+                cv_switches_used += 1
             in_metad = True
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
             _record_notes(work_dir, ledger_notes, round_idx, wall_notes)
             _emit(
                 on_event, "pivot",
-                round_index=round_idx, kind="switch_to_metad",
+                round_index=round_idx, kind=decision.decision,
                 plumed_dat=str(plumed_dat_path),
                 cv=decision.metad_proposal.to_dict(),
-            )
-            continue
-
-        if decision.decision == "switch_cv":
-            assert decision.metad_proposal is not None  # guaranteed by the parser
-            wall_notes = []
-            # The replacement CV is sized on *this* round's trajectory, which
-            # was run under the outgoing bias. That spread is inflated by the
-            # bias that drove the walker across the old coordinate, which is
-            # what `_SIGMA_CEILINGS` in bias_designer exists to catch.
-            _clear_bias_state(plumed_dat_path.parent)
-            adapter = _pivot_to_metad(
-                decision.metad_proposal,
-                source_trajectory=dcd,
-                topology_path=adapter.topology_path,
-                factory=biased_adapter_factory,
-                plumed_dat_path=plumed_dat_path,
-                temperature_k=temperature_k,
-                cv_upper_wall_nm=cv_upper_wall_nm,
-                bias_pace=bias_pace,
-                bias_factor=bias_factor,
-                observable=observable,
-                notes=wall_notes,
-            )
-            cv_switches_used += 1
-            current_plumed_dat = plumed_dat_path
-            n_steps = initial_steps
-            _record_notes(work_dir, ledger_notes, round_idx, wall_notes)
-            _emit(
-                on_event, "pivot",
-                round_index=round_idx, kind="switch_cv",
-                plumed_dat=str(plumed_dat_path),
-                cv=decision.metad_proposal.to_dict(),
+                biased_cvs=[p.label for p in active_cvs],
             )
             continue
 
@@ -809,13 +785,30 @@ def _default_biased_factory(
 # HILLS and COLVAR are to a biased round what the checkpoint is to a vanilla
 # one: the state needed to continue. plumed.dat is the definition of the bias
 # they were deposited under — and the live copy is rewritten in place by every
-# pivot and CV switch, so without a per-round snapshot the rows for the rounds
-# before a `switch_cv` point at a file describing a coordinate they never ran
-# on. All three are snapshotted together and restored together.
-_BIAS_STATE_FILES = (_HILLS_NAME, _COLVAR_NAME, _PLUMED_DAT_NAME)
+# pivot and CV revision, so without a per-round snapshot the rows for the
+# rounds before a `switch_cv` point at a file describing a coordinate they
+# never ran on. All of them are snapshotted together and restored together.
+# Which HILLS files exist depends on how many coordinates are biased.
 
 
-def _snapshot_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> None:
+def _hills_files(active_cvs: list[MetadProposal]) -> list[str]:
+    """The HILLS file(s) the current bias deposits into.
+
+    One CV: `METAD` writes `HILLS`. Several: `PBMETAD` writes one per CV,
+    `HILLS.<label>`. Must agree with what `_build_plumed_input` renders.
+    """
+    if len(active_cvs) <= 1:
+        return [_HILLS_NAME]
+    return [f"{_HILLS_NAME}.{p.label}" for p in active_cvs]
+
+
+def _bias_state_files(active_cvs: list[MetadProposal]) -> list[str]:
+    return _hills_files(active_cvs) + [_COLVAR_NAME, _PLUMED_DAT_NAME]
+
+
+def _snapshot_bias_state(
+    bias_dir: Path, rounds_dir: Path, round_index: int, names: list[str]
+) -> None:
     """Copy the deposited bias alongside the round's checkpoint.
 
     Turning RESTART on makes the live HILLS load-bearing, which turns the
@@ -826,27 +819,29 @@ def _snapshot_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> 
     the same moment as the checkpoint means resume can restore the bias to
     exactly the point the positions correspond to.
     """
-    for name in _BIAS_STATE_FILES:
+    for name in names:
         src = bias_dir / name
         if src.exists():
             shutil.copy2(src, _bias_snapshot_path(rounds_dir, round_index, name))
 
 
-def _clear_bias_state(bias_dir: Path) -> None:
-    """Drop the live HILLS/COLVAR so a new CV starts from zero bias.
+def _clear_bias_state(bias_dir: Path, names: list[str]) -> None:
+    """Drop the live bias files so a replacement CV starts from zero bias.
 
     Hills deposited on the previous coordinate must not carry over: they
     describe a different CV and PLUMED would read them back as if they did
     not. Deleting rather than archiving is deliberate — the outgoing bias is
-    already preserved at `rounds/round_NNN.hills` by `_snapshot_bias_state`,
+    already preserved at `rounds/round_NNN.hills*` by `_snapshot_bias_state`,
     and delete is idempotent, so a resume that re-enters this path cannot
     accumulate half-written archives of an interrupted round.
     """
-    for name in _BIAS_STATE_FILES:
+    for name in names:
         (bias_dir / name).unlink(missing_ok=True)
 
 
-def _restore_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> None:
+def _restore_bias_state(
+    bias_dir: Path, rounds_dir: Path, round_index: int, names: list[str]
+) -> None:
     """Put the bias back to its state at the end of `round_index`.
 
     A missing snapshot is not an error: campaigns that pivoted before
@@ -854,10 +849,52 @@ def _restore_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> N
     the best available behaviour there.
     """
     bias_dir.mkdir(parents=True, exist_ok=True)
-    for name in _BIAS_STATE_FILES:
+    for name in names:
         snapshot = _bias_snapshot_path(rounds_dir, round_index, name)
         if snapshot.exists():
             shutil.copy2(snapshot, bias_dir / name)
+
+
+def _export_state(adapter: MDAdapter) -> str | None:
+    """The walker's State, when the engine can hand it over (see `base.py`)."""
+    export = getattr(adapter, "export_state_xml", None)
+    return export() if callable(export) else None
+
+
+def _write_state_snapshot(adapter: MDAdapter, rounds_dir: Path, round_index: int) -> None:
+    """Beside the checkpoint, so a revision resumed after a crash warm-starts too."""
+    xml = _export_state(adapter)
+    if xml is not None:
+        (rounds_dir / f"round_{round_index:03d}.{_STATE_NAME}").write_text(xml)
+
+
+def _read_state_snapshot(rounds_dir: Path, round_index: int) -> str | None:
+    path = rounds_dir / f"round_{round_index:03d}.{_STATE_NAME}"
+    return path.read_text() if path.exists() else None
+
+
+def _active_cvs(rows: list[store.RoundRow]) -> list[MetadProposal]:
+    """The biased coordinate set, replayed from the persisted decisions.
+
+    `switch_to_metad` and `switch_cv` each start a set of one; `add_cv`
+    appends to it. Nothing else changes it, so the set is a pure function of
+    the round history and never has to be stored separately.
+    """
+    cvs: list[MetadProposal] = []
+    for r in rows:
+        if r.metad_proposal is None:
+            continue
+        if r.decision in ("switch_to_metad", "switch_cv", "add_cv"):
+            cvs = _revised_cvs(r.decision, cvs, MetadProposal.from_dict(r.metad_proposal))
+    return cvs
+
+
+def _revised_cvs(
+    action: str, previous: list[MetadProposal], proposal: MetadProposal
+) -> list[MetadProposal]:
+    if action == "add_cv":
+        return [*previous, proposal]
+    return [proposal]
 
 
 def _bias_snapshot_path(rounds_dir: Path, round_index: int, name: str) -> Path:
@@ -878,8 +915,15 @@ def _round_report(
     observable: ObservableSpec | None = None,
     cv_switches_used: int = 0,
     max_cv_switches: int = 0,
+    active_cvs: list[MetadProposal] | None = None,
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
+
+    With several coordinates biased in parallel the scientist still judges
+    one *primary* surface: the campaign observable's own marginal when the
+    observable is among them, otherwise the first coordinate's. The others
+    are shown as the range each covered (`cv_ranges`), so a coordinate that
+    is not moving is visible as such.
 
     A biased round also carries the free-energy surface *along the campaign
     observable*, reweighted from COLVAR — the surface the task's states are
@@ -918,8 +962,9 @@ def _round_report(
         )
 
     bias_dir = plumed_dat_path.parent
+    active = active_cvs or []
     report = metad_report(
-        bias_dir / _HILLS_NAME,
+        bias_dir / _primary_hills(active, observable),
         bias_dir / _COLVAR_NAME,
         fes_dir,
         temperature_k=temperature_k,
@@ -972,6 +1017,13 @@ def _round_report(
             report["delta_g_low_minus_high_kj_per_mol"] = delta_g_kj_per_mol(
                 profile, low, high, temperature_k
             )
+    report["biased_cvs"] = [p.label for p in active]
+    if len(active) > 1 and colvar_path.exists():
+        columns = load_colvar(colvar_path)
+        report["cv_ranges"] = {
+            p.label: [float(columns[p.label].min()), float(columns[p.label].max())]
+            for p in active if p.label in columns
+        }
     # The CV-revision allowance, so the scientist can weigh a switch against
     # what is left rather than only discovering the action is gone.
     report["cv_switches_used"] = cv_switches_used
@@ -980,6 +1032,17 @@ def _round_report(
     report["trajectory_path"] = str(trajectory_path)
     report["plumed_dat_path"] = str(plumed_dat_path)
     return report
+
+
+def _primary_hills(active: list[MetadProposal], observable: ObservableSpec | None) -> str:
+    """Which HILLS file the round's surface is integrated from."""
+    if len(active) <= 1:
+        return _HILLS_NAME
+    spec = observable or ObservableSpec.ca_rmsd_angstrom()
+    for p in active:
+        if p.cv_type == spec.cv_type and tuple(p.selections) == tuple(spec.selections):
+            return f"{_HILLS_NAME}.{p.label}"
+    return f"{_HILLS_NAME}.{active[0].label}"
 
 
 def _confinement(
@@ -1281,9 +1344,11 @@ def _extend_steps(
     )
 
 
-def _pivot_to_metad(
-    proposal: MetadProposal,
+def _revise_bias(
+    action: str,
     *,
+    previous: list[MetadProposal],
+    proposal: MetadProposal,
     source_trajectory: Path,
     topology_path: Path,
     factory: BiasedAdapterFactory,
@@ -1293,21 +1358,48 @@ def _pivot_to_metad(
     bias_pace: int | None = None,
     bias_factor: float | None = None,
     observable: ObservableSpec | None = None,
+    warm_state: str | None = None,
     notes: list[str] | None = None,
 ) -> MDAdapter:
-    """Resolve a CV proposal into a biased, started adapter.
+    """Apply a coordinate revision to the bias on disk; return the started adapter.
 
-    Renders plumed.dat from the proposal + the CV's fluctuation on
-    `source_trajectory`, writes it to `plumed_dat_path` (the authoritative
-    audit artifact), then builds and starts the biased adapter. PLUMED's own
-    outputs (HILLS, COLVAR) are directed alongside plumed.dat.
+    `switch_to_metad` and `switch_cv` start a fresh bias on one coordinate:
+    every live bias file is dropped (the outgoing ones are already snapshotted
+    beside their round). `add_cv` keeps the hills on the retained coordinates
+    and biases the new one beside them in parallel — a single-CV `HILLS` is
+    moved to the per-CV name `PBMETAD` reads, the new coordinate starts from
+    nothing, COLVAR restarts (its columns change), and RESTART is turned on so
+    the retained hills are read back rather than backed up. Every step is
+    idempotent, so a resume that re-enters this path after a crash lands in
+    the same place.
+
+    `warm_state` places the walker where it was when the revision was
+    decided; without it the adapter starts from the cached structure.
     """
-    plumed_dat_path.parent.mkdir(parents=True, exist_ok=True)
+    bias_dir = plumed_dat_path.parent
+    bias_dir.mkdir(parents=True, exist_ok=True)
+    revised = _revised_cvs(action, previous, proposal)
+    if len(revised) > 3:
+        raise ValueError(
+            f"{action}: the biased set would have {len(revised)} coordinates; "
+            f"the cap is three"
+        )
+    restart = False
+    if action == "add_cv":
+        if len(previous) == 1:
+            single, per_cv = bias_dir / _HILLS_NAME, bias_dir / f"{_HILLS_NAME}.{previous[0].label}"
+            if single.exists() and not per_cv.exists():
+                single.rename(per_cv)
+        (bias_dir / _COLVAR_NAME).unlink(missing_ok=True)
+        restart = any((bias_dir / name).exists() for name in _hills_files(revised))
+    else:
+        _clear_bias_state(bias_dir, _bias_state_files(previous) + _bias_state_files(revised))
+
     plumed_input = _build_plumed_input(
-        proposal,
+        revised,
         source_trajectory,
         topology_path,
-        plumed_dat_path.parent,
+        bias_dir,
         temperature_k=temperature_k,
         cv_upper_wall_nm=cv_upper_wall_nm,
         bias_pace=bias_pace,
@@ -1315,15 +1407,38 @@ def _pivot_to_metad(
         observable=observable,
         notes=notes,
     )
+    if restart:
+        plumed_input = enable_restart(plumed_input)
     plumed_dat_path.write_text(plumed_input)
     biased = factory(plumed_input)
     biased.prepare()
     biased.start()
+    load = getattr(biased, "load_state_xml", None)
+    if warm_state is not None and callable(load):
+        load(warm_state)
     return biased
 
 
+# Grid bounds per coordinate type for the parallel bias. PBMETAD without a
+# grid re-sums every hill every step and its cost grows with the run; with one
+# the cost is constant, but a hill centre outside the grid is a fatal PLUMED
+# error, so the bounds are generous. Torsions are periodic and their grid has
+# to span exactly one period, which PLUMED spells `-pi`/`pi`.
+_GRID_LENGTH_NM = (-0.2, 2.5)
+_GRID_CONTACTS = (-0.3, 1.3)
+_GRID_TORSION = ("-pi", "pi")
+
+
+def _grid_bounds(cv: Any) -> tuple[Any, Any]:
+    if isinstance(cv, TorsionCV):
+        return _GRID_TORSION
+    if isinstance(cv, ContactsCV):
+        return _GRID_CONTACTS
+    return _GRID_LENGTH_NM
+
+
 def _build_plumed_input(
-    proposal: MetadProposal,
+    proposals: list[MetadProposal],
     trajectory_path: Path,
     topology_path: Path,
     output_dir: Path,
@@ -1335,11 +1450,16 @@ def _build_plumed_input(
     observable: ObservableSpec | None = None,
     notes: list[str] | None = None,
 ) -> str:
-    """Proposal → resolved CV → sized bias → rendered plumed.dat text.
+    """Proposals → resolved CVs → sized bias → rendered plumed.dat text.
+
+    One proposal renders well-tempered `METAD` on it. Several render `PBMETAD`
+    — one bias per coordinate, deposited in parallel, each converging to its
+    own marginal — with a grid per coordinate. Every length-dimensioned
+    coordinate gets the campaign's upper wall.
 
     `notes` collects anything the scientist needs to know about the bias that
-    the diagnostics cannot show it — currently the wall. plumed.dat records the
-    same thing as comments, but the scientist never reads plumed.dat.
+    the diagnostics cannot show it — currently the walls. plumed.dat records
+    the same thing as comments, but the scientist never reads plumed.dat.
 
     `observable`, when given, is resolved too and printed in COLVAR under
     `COLVAR_OBSERVABLE_LABEL`, unbiased. That column is what the surface along
@@ -1350,21 +1470,22 @@ def _build_plumed_input(
     the process working directory, so the deposited bias would otherwise land
     outside the campaign entirely.
     """
+    if not proposals:
+        raise ValueError("_build_plumed_input: at least one proposal")
     # Loaded with coordinates, not just connectivity: an `rmsd` CV measures
     # against a reference structure, and the campaign topology is the same
     # reference the vanilla observable uses, so both phases score against one
     # fixed structure rather than two different ones.
     reference = md.load(str(topology_path))
-    cv = design_cv(
-        CVProposal(
-            cv_type=proposal.cv_type,
-            selections=tuple(proposal.selections),
-            label=proposal.label,
-        ),
-        reference.topology,
-        reference=reference,
-        output_dir=output_dir,
-    )
+    cvs = [
+        design_cv(
+            CVProposal(cv_type=p.cv_type, selections=tuple(p.selections), label=p.label),
+            reference.topology,
+            reference=reference,
+            output_dir=output_dir,
+        )
+        for p in proposals
+    ]
     # None means "let bias_designer decide", so its defaults stay the single
     # definition of PACE and BIASFACTOR rather than being restated here.
     overrides = {
@@ -1372,20 +1493,33 @@ def _build_plumed_input(
         for k, v in (("pace", bias_pace), ("bias_factor", bias_factor))
         if v is not None
     }
-    bias = design_bias(
-        cv, trajectory_path, topology_path, temperature_k=temperature_k, **overrides
-    )
-    wall = design_upper_wall(
-        cv,
-        cv_upper_wall_nm,
-        trajectory_path=trajectory_path,
-        topology_path=topology_path,
-    )
-    if notes is not None:
-        notes.extend(_wall_notes(cv, wall, cv_upper_wall_nm))
-    cvs: tuple[Any, ...] = (cv,)
+    sized = [
+        design_bias(cv, trajectory_path, topology_path, temperature_k=temperature_k, **overrides)
+        for cv in cvs
+    ]
+    walls = []
+    for cv in cvs:
+        wall = design_upper_wall(
+            cv, cv_upper_wall_nm, trajectory_path=trajectory_path, topology_path=topology_path,
+        )
+        if notes is not None:
+            notes.extend(_wall_notes(cv, wall, cv_upper_wall_nm))
+        if wall is not None:
+            walls.append(wall)
+    if len(cvs) == 1:
+        bias: Any = sized[0]
+    else:
+        first = sized[0]
+        bias = ParallelBias(
+            cv_labels=tuple(cv.label for cv in cvs),
+            sigma=tuple(b.sigma[0] for b in sized),
+            height=first.height, pace=first.pace,
+            bias_factor=first.bias_factor, temperature_k=first.temperature_k,
+            grid=tuple(_grid_bounds(cv) for cv in cvs),
+        )
+    printed: tuple[Any, ...] = tuple(cvs)
     if observable is not None:
-        cvs += (
+        printed += (
             design_cv(
                 observable_cv_proposal(observable),
                 reference.topology,
@@ -1394,9 +1528,9 @@ def _build_plumed_input(
             ),
         )
     return PlumedInput(
-        cvs=cvs,
+        cvs=printed,
         bias=bias,
-        walls=(wall,) if wall is not None else (),
+        walls=tuple(walls),
         output_dir=Path(output_dir).resolve(),
     ).render()
 
@@ -1461,7 +1595,7 @@ def _row_to_result(row: store.RoundRow) -> RoundResult:
         report=row.report,
         decision=Decision(
             decision=cast(
-                Literal["extend", "stop", "switch_to_metad", "switch_cv"],
+                Literal["extend", "stop", "switch_to_metad", "switch_cv", "add_cv"],
                 row.decision,
             ),
             reason=row.reason,
@@ -1492,6 +1626,7 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
             # history holds counts from two different CVs, and a bare list of
             # recrossings would invite exactly the comparison F7 was about.
             cv_label=r.report.get("cv_label"),
+            biased_cvs=r.report.get("biased_cvs"),
             fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
             recrossings=r.report.get("recrossings"),
             # Carried so the trend is visible: a range that shrinks round on

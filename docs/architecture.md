@@ -117,6 +117,7 @@ mdpilot/
 │   │   ├── phase_vanilla.md           # equilibrium rubric + pivot rule
 │   │   ├── phase_metad.md             # free-energy rubric
 │   │   ├── action_switch_cv.md        # when to revise the biased coordinate
+│   │   ├── action_add_cv.md           # when to bias several coordinates at once
 │   │   ├── cv_vocabulary.md           # CV types, arities, bounded-vs-unbounded
 │   │   ├── output_contract.md         # extra_ns / ledger_note / reason
 │   │   ├── setup_role.md              # [setup agent] what it emits, and for whom

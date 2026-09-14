@@ -147,7 +147,7 @@ def verdict(
 
     biased = [r for r in rows if r.plumed_dat_path is not None]
     pivot = next((r for r in rows if r.decision == "switch_to_metad"), None)
-    switches = [r for r in rows if r.decision == "switch_cv"]
+    switches = [r for r in rows if r.decision in ("switch_cv", "add_cv")]
 
     out: dict[str, Any] = {
         "work_dir": str(work_dir),
@@ -180,7 +180,8 @@ def verdict(
     out["cv_switches"] = [
         {
             "round": r.round_index,
-            "from": r.report.get("cv_label"),
+            "kind": r.decision,
+            "from": r.report.get("biased_cvs") or r.report.get("cv_label"),
             "to": r.metad_proposal,
             "rounds_since_high_visited": r.report.get("rounds_since_high_visited"),
             "rounds_since_low_visited": r.report.get("rounds_since_low_visited"),

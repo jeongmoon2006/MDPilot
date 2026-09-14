@@ -306,7 +306,9 @@ class ParallelBias:
     temperature_k: float = 300.0
     hills_prefix: str = "HILLS"
     bias_label: str = "pb"
-    grid: tuple[tuple[float, float], ...] | None = None
+    # Bounds may be PLUMED's own tokens (`"-pi"`, `"pi"`): a periodic
+    # coordinate's grid must span exactly one period, which a float cannot.
+    grid: tuple[tuple[float | str, float | str], ...] | None = None
 
     def __post_init__(self) -> None:
         if len(self.cv_labels) != len(self.sigma):
@@ -329,7 +331,7 @@ class ParallelBias:
                     f"({len(self.grid)} vs {len(self.cv_labels)})"
                 )
             for label, (lo, hi) in zip(self.cv_labels, self.grid, strict=True):
-                if not hi > lo:
+                if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and not hi > lo:
                     raise ValueError(f"pbmetad: grid for {label} must have max > min")
 
     @property
@@ -344,9 +346,10 @@ class ParallelBias:
             f"FILE={','.join(self.hills_files)}"
         )
         if self.grid is not None:
+            fmt = lambda v: v if isinstance(v, str) else f"{v:g}"  # noqa: E731
             line += (
-                f" GRID_MIN={','.join(f'{lo:g}' for lo, _ in self.grid)}"
-                f" GRID_MAX={','.join(f'{hi:g}' for _, hi in self.grid)}"
+                f" GRID_MIN={','.join(fmt(lo) for lo, _ in self.grid)}"
+                f" GRID_MAX={','.join(fmt(hi) for _, hi in self.grid)}"
             )
         return line
 

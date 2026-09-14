@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -570,3 +571,46 @@ def test_a_numpy_scalar_in_a_report_is_stored_as_a_plain_number(tmp_path: Path) 
     assert report == {"mean": 1.5, "n_frames": 3}
     assert type(report["mean"]) is float
     assert type(report["n_frames"]) is int
+
+
+def test_add_cv_persists_and_an_older_table_is_widened_for_it(tmp_path: Path) -> None:
+    import sqlite3
+
+    # A table from before `add_cv` existed: the previous CHECK constraint.
+    db = tmp_path / "state.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE campaign (id INTEGER PRIMARY KEY CHECK (id = 1),
+                                   config_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE rounds (
+                round_index INTEGER PRIMARY KEY, n_steps INTEGER NOT NULL,
+                dcd_path TEXT NOT NULL, checkpoint_path TEXT, report_json TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('extend', 'stop', 'switch_to_metad', 'switch_cv')),
+                reason TEXT NOT NULL, extra_ns REAL, metad_proposal_json TEXT,
+                plumed_dat_path TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE ledger (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                 round_index INTEGER NOT NULL, text TEXT NOT NULL,
+                                 created_at TEXT NOT NULL);
+            """
+        )
+        conn.execute("INSERT INTO campaign VALUES (1, ?, 't')", (json.dumps(_config()),))
+        conn.execute(
+            "INSERT INTO rounds VALUES (1, 10, 'a.dcd', NULL, '{}', 'switch_cv', 'r', NULL, "
+            "'{\"cv_type\": \"rmsd\", \"selections\": [\"name CA\"], \"label\": \"r\"}', "
+            "'p.dat', 't')"
+        )
+
+    store.init_campaign(tmp_path, _config())          # migrates in place
+    store.append_round(
+        tmp_path, round_index=2, n_steps=10, dcd_path=tmp_path / "b.dcd", checkpoint_path=None,
+        report={}, decision="add_cv", reason="insufficient", extra_ns=None,
+        metad_proposal={"cv_type": "torsion", "selections": ["a", "b", "c", "d"], "label": "t"},
+        plumed_dat_path=tmp_path / "p.dat",
+    )
+
+    rows = store.list_rounds(tmp_path)
+    assert [r.decision for r in rows] == ["switch_cv", "add_cv"]
+    assert rows[0].metad_proposal["label"] == "r"      # the older row survived the copy
+    store.init_campaign(tmp_path, _config())           # and the migration is idempotent

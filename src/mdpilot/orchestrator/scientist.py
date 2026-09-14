@@ -150,6 +150,7 @@ def knowledge_keys(
     keys = ["role", f"phase_{phase}"]
     if allow_cv_switch:
         keys.append("action_switch_cv")
+        keys.append("action_add_cv")
     if can_propose_cv:
         keys.append("cv_vocabulary")
     keys.append("output_contract")
@@ -333,15 +334,19 @@ _METAD_DECISION_TOOL = {
     },
 }
 
-# The biased action space with CV revision re-opened. Offered only while the
-# campaign has a switch left in its budget: past that, `switch_cv` is dropped
-# from the enum so a further revision is unrepresentable rather than
-# emitted-and-rejected — the same reason a second `switch_to_metad` is absent
-# from `_METAD_DECISION_TOOL`.
+# The biased action space with CV revision re-opened. Two revisions share one
+# allowance: `switch_cv` replaces the coordinate (it was wrong), `add_cv` keeps
+# it and biases one more alongside it (it was insufficient) — the biased phase
+# starts on one CV and escalates to several only when the evidence says one
+# cannot carry the transition. Offered only while the campaign has a revision
+# left in its budget: past that, both are dropped from the enum so a further
+# revision is unrepresentable rather than emitted-and-rejected — the same
+# reason a second `switch_to_metad` is absent from `_METAD_DECISION_TOOL`.
 _METAD_SWITCH_TOOL = {
     "name": "record_decision",
     "description": (
-        "Record the decision (extend, stop, or switch_cv) for this biased round."
+        "Record the decision (extend, stop, switch_cv or add_cv) for this "
+        "biased round."
     ),
     "strict": True,
     "input_schema": {
@@ -350,8 +355,12 @@ _METAD_SWITCH_TOOL = {
             **_METAD_DECISION_TOOL["input_schema"]["properties"],
             "decision": {
                 "type": "string",
-                "enum": ["extend", "stop", "switch_cv"],
-                "description": "What to do next with the biased run.",
+                "enum": ["extend", "stop", "switch_cv", "add_cv"],
+                "description": (
+                    "What to do next with the biased run. switch_cv replaces "
+                    "the biased coordinate; add_cv keeps it and biases the "
+                    "proposed one in parallel with it."
+                ),
             },
             # Same shape as the vanilla proposal, but the description has to
             # name *this* tool's proposal action. Reused verbatim, it told the
@@ -363,7 +372,7 @@ _METAD_SWITCH_TOOL = {
                 **_METAD_PROPOSAL_SCHEMA,
                 "description": (
                     "Structured CV proposal. Non-null iff decision is "
-                    "'switch_cv'; null otherwise."
+                    "'switch_cv' or 'add_cv'; null otherwise."
                 ),
             },
         },
@@ -447,7 +456,7 @@ class MetadProposal:
 
 @dataclass(frozen=True)
 class Decision:
-    decision: Literal["extend", "stop", "switch_to_metad", "switch_cv"]
+    decision: Literal["extend", "stop", "switch_to_metad", "switch_cv", "add_cv"]
     reason: str
     extra_ns: float | None
     ledger_note: str | None = None
@@ -510,7 +519,7 @@ def decide(
     no `state_thresholds`, and the biased phase would then count recrossings
     against whichever two basins are currently deepest (F9).
 
-    `allow_cv_switch` adds `switch_cv` to the biased action space. The caller
+    `allow_cv_switch` adds `switch_cv` and `add_cv` to the biased action space. The caller
     owns that budget: once the campaign has spent its allowance the action is
     dropped from the enum rather than refused after the fact, so the model
     never emits a decision the loop will not honour.
@@ -686,7 +695,7 @@ def _tool_block(response: Any) -> Any:
     )
 
 
-_PROPOSAL_ACTIONS = frozenset({"switch_to_metad", "switch_cv"})
+_PROPOSAL_ACTIONS = frozenset({"switch_to_metad", "switch_cv", "add_cv"})
 
 
 def _parse_decision(data: dict[str, Any]) -> Decision:
@@ -694,9 +703,10 @@ def _parse_decision(data: dict[str, Any]) -> Decision:
     metad_raw = data.get("metad_proposal")
     metad = MetadProposal.from_dict(metad_raw) if metad_raw else None
 
-    # Both actions that (re)define the biased coordinate carry a proposal:
+    # Every action that (re)defines the biased coordinates carries a proposal:
     # `switch_to_metad` opens the biased phase, `switch_cv` replaces the CV
-    # inside it. Everything else must leave it null.
+    # inside it, `add_cv` biases one more beside it. Everything else must
+    # leave it null.
     if decision in _PROPOSAL_ACTIONS and metad is None:
         raise RuntimeError(
             f"scientist: decision={decision!r} but metad_proposal is null"

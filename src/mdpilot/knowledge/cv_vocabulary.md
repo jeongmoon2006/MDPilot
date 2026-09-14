@@ -1,6 +1,6 @@
 Populate `metad_proposal` when you choose the action that (re)defines the
-biased coordinate: `switch_to_metad` in the vanilla phase, `switch_cv` in the
-biased phase. Your tool's `decision` enum says which of the two is available
+biased coordinate: `switch_to_metad` in the vanilla phase, `switch_cv` or
+`add_cv` in the biased phase. Your tool's `decision` enum says which of the two is available
 this round, and never both:
 
 - `cv_type` — one of `distance`, `torsion`, `gyration`, `rmsd`, `contacts`.

@@ -498,6 +498,27 @@ class OpenMMAdapter:
     def load_checkpoint(self, path: Path) -> None:
         load_checkpoint(self._require_sim(), path)
 
+    def export_state_xml(self) -> str:
+        """The walker as an OpenMM State: positions, velocities, box, time.
+
+        A checkpoint is bound to the System it was taken from and cannot be
+        loaded into one with a different set of forces — which is every
+        pivot, since each attaches a new `PlumedForce`. A State has no such
+        binding, so it is what carries the walker across a change of bias.
+        Before this a pivot restarted from the cached post-equilibration
+        structure: a campaign that had spent nine nanoseconds unfolding a
+        hairpin then spent eight more unfolding it again on the new
+        coordinate.
+        """
+        state = self._require_sim().context.getState(
+            getPositions=True, getVelocities=True, enforcePeriodicBox=True
+        )
+        return XmlSerializer.serialize(state)
+
+    def load_state_xml(self, xml: str) -> None:
+        """Place the walker where `export_state_xml` last saw it."""
+        self._require_sim().context.setState(XmlSerializer.deserialize(xml))
+
     def _require_sim(self) -> app.Simulation:
         if self._sim is None:
             raise RuntimeError("OpenMMAdapter not started; call start() first")
