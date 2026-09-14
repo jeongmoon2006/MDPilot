@@ -50,6 +50,12 @@ ever made long after the walker stopped moving. If the per-round range has
 collapsed into one state while `fes_depth_kj_per_mol` keeps growing, the bias
 is filling a basin the coordinate cannot lead the system out of: say so in
 `reason` and record it in `ledger_note`.
+- `rounds_since_low_visited` / `rounds_since_high_visited` — consecutive
+rounds, counting this one, in which the walker never entered that state. 0
+means it was there this round. This is the trap seen from the other side:
+`rounds_confined` catches a walker parked inside one state, this catches one
+roaming the disordered region without ever returning to the state it started
+from — which reads as "exploring" on the per-round range and is not.
 - `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol`,
 `n_fes_estimates` — shape of the surface recovered so far. `cv_min` and
 `cv_max` are the range the walker actually visited, and `fes_depth` is

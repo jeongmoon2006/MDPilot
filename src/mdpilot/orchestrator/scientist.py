@@ -167,6 +167,40 @@ def build_system_prompt(
         )
     )
 
+# What the model says it read. Checked against the report before the decision
+# is accepted: a real campaign's round-5 `reason` said "recrossings has
+# increased to 2" and its ledger note called the crossing requirement
+# satisfied, while the report said 1 — and the ledger is the next round's
+# memory, so a misread number becomes a fact every later round reasons from.
+# Strict mode cannot express a free-keyed object, hence the list of pairs.
+_CITED_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "description": "A key of diagnostic_report.",
+            },
+            "value": {
+                # Strings too: `confined_to_state` is "high" / "low" / null,
+                # and a schema that could not say so made the model write null
+                # for it — which the check then refused, three times, and a
+                # correct `switch_cv` was converted to an extend.
+                "type": ["number", "boolean", "string", "null"],
+                "description": "The value you read for it, as the report states it.",
+            },
+        },
+        "required": ["field", "value"],
+        "additionalProperties": False,
+    },
+    "description": (
+        "Every diagnostic value the decision rests on or that reason / "
+        "ledger_note quotes, as it appears in diagnostic_report. Checked: a "
+        "value that disagrees with the report is sent back to you."
+    ),
+}
+
 _METAD_PROPOSAL_SCHEMA = {
     "type": ["object", "null"],
     "properties": {
@@ -240,9 +274,12 @@ _DECISION_TOOL = {
                     "worth recording."
                 ),
             },
+            "cited": _CITED_SCHEMA,
             "metad_proposal": _METAD_PROPOSAL_SCHEMA,
         },
-        "required": ["decision", "reason", "extra_ns", "ledger_note", "metad_proposal"],
+        "required": [
+            "decision", "reason", "extra_ns", "ledger_note", "cited", "metad_proposal",
+        ],
         "additionalProperties": False,
     },
 }
@@ -289,8 +326,9 @@ _METAD_DECISION_TOOL = {
                     "new is worth recording."
                 ),
             },
+            "cited": _CITED_SCHEMA,
         },
-        "required": ["decision", "reason", "extra_ns", "ledger_note"],
+        "required": ["decision", "reason", "extra_ns", "ledger_note", "cited"],
         "additionalProperties": False,
     },
 }
@@ -414,24 +452,34 @@ class Decision:
     extra_ns: float | None
     ledger_note: str | None = None
     metad_proposal: MetadProposal | None = None
+    # (field, value) pairs the model says it read from the report. Verified.
+    cited: tuple[tuple[str, Any], ...] = ()
 
 
-class UnresolvableProposal(RuntimeError):
-    """Every attempt produced a CV proposal the campaign topology cannot resolve.
+class DecisionRefused(RuntimeError):
+    """Every attempt produced a decision the caller cannot accept.
 
-    Carries the last decision and the last resolution error so the caller can
-    record what was asked for and why it was refused, rather than only that
-    the call failed.
+    Carries the last decision and the last refusal so the caller can record
+    what was asked for and why it was refused, rather than only that the call
+    failed. The subclasses say which check refused it.
     """
 
     def __init__(self, decision: Decision, error: str, attempts: int) -> None:
         super().__init__(
-            f"scientist: no resolvable CV proposal after {attempts} attempt(s); "
+            f"scientist: decision refused after {attempts} attempt(s); "
             f"last error: {error}"
         )
         self.decision = decision
         self.error = error
         self.attempts = attempts
+
+
+class UnresolvableProposal(DecisionRefused):
+    """The CV proposal cannot be resolved against the campaign topology."""
+
+
+class MisquotedReport(DecisionRefused):
+    """The values the model cited disagree with the report it was given."""
 
 
 def decide(
@@ -481,6 +529,12 @@ def decide(
     to the model as an `is_error` tool result and it proposes again, up to
     `max_attempts` times; then `UnresolvableProposal` is raised carrying the
     last decision and error. Same mechanism as `setup_agent.propose_task_file`.
+
+    The `cited` pairs are checked the same way, against `diagnostic_report`:
+    a field the report does not have, or a value that disagrees with it beyond
+    rounding, goes back to the model naming both numbers, and exhaustion raises
+    `MisquotedReport`. This is the check that keeps a misread number out of the
+    ledger, where it would be memory for every later round.
     """
     client = client or anthropic.Anthropic()
     if phase not in _TOOL_FOR_PHASE:
@@ -535,37 +589,90 @@ def decide(
         )
         block = _tool_block(response)
         decision = _parse_decision(block.input)
-        if validate_proposal is None or decision.metad_proposal is None:
+
+        refusal: type[DecisionRefused] | None = None
+        error = check_citations(decision.cited, diagnostic_report)
+        if error is not None:
+            refusal = MisquotedReport
+            feedback = (
+                "Values you cited disagree with diagnostic_report. Re-read the "
+                f"report and call the tool again.\n\n{error}"
+            )
+        elif validate_proposal is not None and decision.metad_proposal is not None:
+            try:
+                validate_proposal(decision.metad_proposal)
+            except ValueError as e:
+                refusal, error = UnresolvableProposal, str(e)
+                feedback = (
+                    "The CV proposal cannot be resolved against the campaign "
+                    f"topology. Fix the selection(s) and call the tool again.\n\n{error}"
+                )
+        if refusal is None:
             return decision
-        try:
-            validate_proposal(decision.metad_proposal)
-        except ValueError as e:
-            last_decision, last_error = decision, str(e)
-            # Answered as a `tool_result`, not a bare user turn: the API
-            # rejects an assistant `tool_use` not followed by its result.
-            messages += [
-                {"role": "assistant", "content": response.content},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "is_error": True,
-                            "content": (
-                                "The CV proposal cannot be resolved against the "
-                                "campaign topology. Fix the selection(s) and "
-                                f"call the tool again.\n\n{last_error}"
-                            ),
-                        }
-                    ],
-                },
-            ]
-            continue
-        return decision
+
+        last_decision, last_error, last_refusal = decision, error, refusal
+        # Answered as a `tool_result`, not a bare user turn: the API rejects
+        # an assistant `tool_use` not followed by its result.
+        messages += [
+            {"role": "assistant", "content": response.content},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "is_error": True,
+                        "content": feedback,
+                    }
+                ],
+            },
+        ]
 
     assert last_decision is not None and last_error is not None
-    raise UnresolvableProposal(last_decision, last_error, max_attempts)
+    raise last_refusal(last_decision, last_error, max_attempts)
+
+
+# How far a cited value may sit from the reported one and still count as the
+# same number: the model rounds ("24.648" -> "24.6", "12.325" -> "12"), and
+# rounding is not misreading. 5% relative or 0.05 absolute, whichever is
+# larger; a count of 1 read as 2 is out by either measure.
+_CITATION_RTOL = 0.05
+_CITATION_ATOL = 0.05
+
+
+def check_citations(
+    cited: tuple[tuple[str, Any], ...], report: dict[str, Any]
+) -> str | None:
+    """Every disagreement between what was cited and what the report says.
+
+    None when they agree. Booleans and nulls must match exactly; numbers may
+    differ by rounding. A field the report does not carry is a disagreement
+    too — it is usually a value remembered from an earlier round.
+    """
+    problems: list[str] = []
+    for field, value in cited:
+        if field not in report:
+            problems.append(f"`{field}`: cited {value!r}, but the report has no such field")
+            continue
+        actual = report[field]
+        if isinstance(actual, str):
+            # Labels and paths: exact when the model quotes one, ignored when
+            # it does not — these are not numbers to misread, and the check
+            # exists for numbers.
+            if isinstance(value, str) and value != actual:
+                problems.append(f"`{field}`: cited {value!r}, report says {actual!r}")
+            continue
+        if isinstance(value, bool) or isinstance(actual, bool) or value is None or actual is None:
+            if value != actual:
+                problems.append(f"`{field}`: cited {value!r}, report says {actual!r}")
+            continue
+        if isinstance(value, str) or not isinstance(actual, (int, float)):
+            continue
+        if abs(float(value) - float(actual)) > max(
+            _CITATION_ATOL, _CITATION_RTOL * abs(float(actual))
+        ):
+            problems.append(f"`{field}`: cited {value!r}, report says {actual!r}")
+    return "\n".join(problems) if problems else None
 
 
 def _tool_block(response: Any) -> Any:
@@ -607,4 +714,5 @@ def _parse_decision(data: dict[str, Any]) -> Decision:
         extra_ns=data["extra_ns"],
         ledger_note=data.get("ledger_note"),
         metad_proposal=metad,
+        cited=tuple((c["field"], c["value"]) for c in data.get("cited") or ()),
     )

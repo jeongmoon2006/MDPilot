@@ -455,3 +455,38 @@ def test_restricted_to_preserves_label_and_periodicity() -> None:
     r = s.restricted_to(-1.0, 1.0)
     assert (r.cv_label, r.periodic) == ("phi", True)
     assert r.cv.min() >= -1.0 and r.cv.max() <= 1.0
+
+
+# ---------- reweighting onto the campaign observable ----------
+
+def test_reweighting_recovers_a_known_surface_from_a_flattened_run(tmp_path: Path) -> None:
+    """Sample a harmonic well under the bias that exactly cancels it, so the
+    biased trajectory is uniform; reweighting by exp(V/kT) must give the well
+    back. This is the identity the whole comparison rests on."""
+    from mdpilot.diagnostics.free_energy import (
+        _KB_KJ_PER_MOL_K, delta_g_kj_per_mol, load_fes, reweighted_profile, write_fes,
+    )
+    kt = _KB_KJ_PER_MOL_K * 300.0
+    k = 40.0                                          # kJ/mol per unit^2
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-1.0, 1.0, 200_000)               # what a perfectly filled well samples
+    bias = -0.5 * k * x**2                            # V = -F flattens F = k x^2 / 2
+
+    fes = reweighted_profile(x, bias, 300.0, n_bins=40, label="x")
+
+    expected = 0.5 * k * fes.cv**2
+    assert np.abs(fes.free_energy - expected).max() < 0.5 * kt
+    assert fes.free_energy.min() == 0.0
+    # Round-trips through the sum_hills text layout the rest of the module reads.
+    again = load_fes(write_fes(fes, tmp_path / "fes.dat"))
+    assert again.cv_label == "x"
+    assert np.allclose(again.free_energy, fes.free_energy, atol=1e-5)
+    # Symmetric well: the two flanks hold equal population.
+    assert abs(delta_g_kj_per_mol(fes, -0.5, 0.5, 300.0)) < 0.2 * kt
+
+
+def test_reweighting_refuses_misaligned_inputs() -> None:
+    from mdpilot.diagnostics.free_energy import reweighted_profile
+
+    with pytest.raises(ValueError, match="frames but"):
+        reweighted_profile(np.zeros(10), np.zeros(9))

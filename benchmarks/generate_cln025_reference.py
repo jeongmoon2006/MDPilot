@@ -3,13 +3,29 @@
 The campaign benchmark asks whether the scientist's biased phase recovered the
 right surface. "Right" needs a yardstick that does not depend on which CV the
 scientist happened to bias, so this runs a long well-tempered metadynamics
-simulation *directly on the campaign observable* — the fraction of native CA
-contacts the task file declares — through the same adapter, force field, bias
-designer and PLUMED writer a campaign uses. Only the length and the seed
-differ. A campaign whose reweighted surface on that observable matches this one
-found the surface the method converges to, which is the agent's job; whether
-the force field's surface is nature's is a separate question the literature
-band in `run_cln025_e2e.py` addresses.
+simulation through the same adapter, force field, bias designer and PLUMED
+writer a campaign uses — only the length and the seed differ — and reports the
+surface *along the campaign observable*, the fraction of native CA contacts
+the task file declares. A campaign whose surface on that observable matches
+this one found the surface the method converges to, which is the agent's job;
+whether the force field's surface is nature's is a separate question the
+literature band in `run_cln025_e2e.py` addresses.
+
+`--bias` picks what the reference biases. `observable` biases the contact
+fraction itself, so the surface is `sum_hills` on it directly. `rmsd` biases
+CA-RMSD to the native structure under the task's upper wall — the coordinate
+the scientist switches to when contacts trap the walker (F13) — and the
+surface on the observable is reweighted from the column PLUMED prints for it,
+exactly as a campaign's is. `pbmetad` biases RMSD (walled), the contact
+fraction and the radius of gyration in parallel (PLUMED PBMETAD), each bias
+converging to its own marginal, so the surface on the observable is
+`sum_hills` on the contact-fraction hills and the reweighting is a
+cross-check. The first 50 ns reference on `observable` reproduced F13 on
+itself: unfolded at 2.5 ns, five nanoseconds parked at Q ≈ 0.05 under
+136 kJ/mol of bias, then not one folded frame in its last 25 ns; `rmsd` sat
+unfolded from 1 ns under 115 kJ/mol. A 1-D bias on a coordinate orthogonal to
+the barrier that gates refolding piles up without lowering it, however long
+it runs — which is what covering several coordinates at once is for.
 
 The reference validates itself before it is written: the well-tempered drift
 between the half-way and final estimates must be below kT and the walker must
@@ -38,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -46,21 +61,31 @@ from pathlib import Path
 from typing import Any
 
 import mdtraj as md
-import numpy as np
 
 from mdpilot.adapters.openmm_adapter import OpenMMAdapter
-from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
+from mdpilot.adapters.plumed_writer import ParallelBias, PlumedInput, enable_restart
 from mdpilot.diagnostics.free_energy import (
     _KB_KJ_PER_MOL_K,
     _baseline_index,
     count_recrossings,
+    delta_g_kj_per_mol,
     fes_drift_kj_per_mol,
     load_colvar,
     load_fes,
     sum_hills,
 )
+from mdpilot.diagnostics.free_energy import (
+    FreeEnergySurface,
+    reweighted_profile,
+    write_fes,
+)
+from mdpilot.observables import (
+    COLVAR_OBSERVABLE_LABEL,
+    colvar_to_observable_factor,
+    observable_cv_proposal,
+)
 from mdpilot.orchestrator.loop import steps_per_ns_for
-from mdpilot.sampling.bias_designer import design_bias
+from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 from mdpilot.task_file import load_task_file
 
@@ -85,6 +110,7 @@ def build_reference(
     chunk_ns: float,
     seed: int,
     min_recrossings: int,
+    bias_cv: str = "observable",
     data_dir: Path = _DATA_DIR,
     task_file: Path = _TASK_FILE,
 ) -> dict[str, Any]:
@@ -93,7 +119,7 @@ def build_reference(
     assert observable is not None, "the task file must declare the observable"
     low, high = task.campaign["state_thresholds"]
 
-    work_dir = data_dir / "reference"
+    work_dir = data_dir / ("reference" if bias_cv == "observable" else f"reference_{bias_cv}")
     chunks_dir = work_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     temperature_k = task.spec.ensemble.temperature_k
@@ -117,21 +143,71 @@ def build_reference(
 
     # --- the bias, exactly as a campaign builds it at the pivot ---
     reference = md.load(str(vanilla.topology_path))
-    cv = design_cv(
-        CVProposal(
-            cv_type=observable.cv_type,
-            selections=tuple(observable.selections),
+    def resolve(proposal: CVProposal):
+        return design_cv(proposal, reference.topology, reference=reference, output_dir=work_dir)
+
+    def sized(cv):
+        return design_bias(cv, vanilla_dcd, vanilla.topology_path, temperature_k=temperature_k)
+
+    rmsd_proposal = CVProposal(cv_type="rmsd", selections=("name CA",), label="rmsd_ca")
+    walls: tuple = ()
+    if bias_cv == "observable":
+        # The observable itself is biased: its column already is the observable,
+        # and adding a second copy would change COLVAR's layout under a run
+        # that may be resuming.
+        cv = resolve(CVProposal(
+            cv_type=observable.cv_type, selections=tuple(observable.selections),
             label=observable.name,
-        ),
-        reference.topology,
-        reference=reference,
-        output_dir=work_dir,
-    )
-    bias = design_bias(cv, vanilla_dcd, vanilla.topology_path, temperature_k=temperature_k)
-    plumed_input = PlumedInput(cvs=(cv,), bias=bias, output_dir=work_dir.resolve()).render()
+        ))
+        bias = sized(cv)
+        observable_cv, observable_column = cv, cv.label
+        cvs: tuple[Any, ...] = (cv,)
+        hills_for_surface = bias.hills_file
+    elif bias_cv == "rmsd":
+        # Something else is biased; the observable rides along unbiased in
+        # COLVAR, so the surface on it comes from where a campaign's does.
+        cv = resolve(rmsd_proposal)
+        bias = sized(cv)
+        observable_cv = resolve(observable_cv_proposal(observable))
+        observable_column = COLVAR_OBSERVABLE_LABEL
+        cvs = (cv, observable_cv)
+        hills_for_surface = None
+    elif bias_cv == "pbmetad":
+        rmsd_cv = resolve(rmsd_proposal)
+        observable_cv = resolve(observable_cv_proposal(observable))
+        rg_cv = resolve(CVProposal(cv_type="gyration", selections=("name CA",), label="rg_ca"))
+        per_cv = [sized(c) for c in (rmsd_cv, observable_cv, rg_cv)]
+        cv = rmsd_cv
+        bias = ParallelBias(
+            cv_labels=(rmsd_cv.label, observable_cv.label, rg_cv.label),
+            sigma=tuple(b.sigma[0] for b in per_cv),
+            height=per_cv[0].height, pace=per_cv[0].pace,
+            bias_factor=per_cv[0].bias_factor, temperature_k=temperature_k,
+            # Generous bounds: the wall turns RMSD around near 0.9 nm, Rg has
+            # reached 1.05 nm, and a hill centre outside the grid is a fatal
+            # PLUMED error.
+            grid=((-0.2, 1.6), (-0.3, 1.3), (0.1, 2.0)),
+        )
+        observable_column = COLVAR_OBSERVABLE_LABEL
+        cvs = (rmsd_cv, observable_cv, rg_cv)
+        # Each parallel bias converges to its CV's own marginal, so the
+        # contact-fraction hills integrate straight to the surface wanted.
+        hills_for_surface = f"{bias.hills_prefix}.{observable_cv.label}"
+    else:
+        raise ValueError(f"--bias must be observable, rmsd or pbmetad; got {bias_cv!r}")
+    if bias_cv != "observable":
+        wall = design_upper_wall(
+            cv, task.campaign.get("cv_upper_wall_nm"),
+            trajectory_path=vanilla_dcd, topology_path=vanilla.topology_path,
+        )
+        walls = (wall,) if wall is not None else ()
+    plumed_input = PlumedInput(
+        cvs=cvs, bias=bias, walls=walls, output_dir=work_dir.resolve(),
+    ).render()
     (work_dir / "plumed.reference.dat").write_text(plumed_input)
-    _log(f"bias: SIGMA={bias.sigma[0]:.4g} (floored={bias.sigma_floored}) "
-         f"HEIGHT={bias.height:.3g} PACE={bias.pace} gamma={bias.bias_factor:g}")
+    _log(f"bias on {','.join(bias.cv_labels)}: SIGMA={','.join(f'{s:.3g}' for s in bias.sigma)} "
+         f"HEIGHT={bias.height:.3g} PACE={bias.pace} gamma={bias.bias_factor:g}"
+         + (f"; wall at {walls[0].at:g}" if walls else ""))
 
     # --- biased: chunked, checkpointed, resumable ---
     done = sorted(chunks_dir.glob("chunk_*.chk"))
@@ -164,29 +240,68 @@ def build_reference(
                  f"{_fmt_time(elapsed)}; ~{_fmt_time(remaining)} left")
 
     # --- integrate and judge ---
-    hills = work_dir / bias.hills_file
+    # For `rmsd` the biased CV's own hills carry the drift test; the surface
+    # on the observable comes from reweighting instead.
+    hills = work_dir / (hills_for_surface or bias.hills_file)
     colvar = work_dir / "COLVAR"
     n_hills = sum(1 for line in hills.read_text().splitlines() if line and not line.startswith("#"))
     stride = max(10, n_hills // 500)
     surfaces = sum_hills(hills, work_dir / "fes", stride=stride)
-    final = load_fes(surfaces[-1])
+    # Drift is a property of the deposited bias, so it is measured on the
+    # biased CV's own surface whatever that CV is.
+    final_biased = load_fes(surfaces[-1])
     baseline = load_fes(surfaces[_baseline_index(len(surfaces))]) if len(surfaces) >= 2 else None
-    drift = fes_drift_kj_per_mol(baseline, final) if baseline is not None else None
-    series = load_colvar(colvar)[final.cv_label]
+    drift = fes_drift_kj_per_mol(baseline, final_biased) if baseline is not None else None
+
+    # The reference surface is on the observable, in the observable's units.
+    # PLUMED's axis is the raw CV (nm, radians, a contact fraction).
+    colvar_columns = load_colvar(colvar)
+    factor = colvar_to_observable_factor(observable, observable_cv)
+    series = colvar_columns[observable_column] * factor
+    if hills_for_surface is not None:
+        final = _in_observable_units(final_biased, factor)
+    else:
+        final = reweighted_profile(
+            series, colvar_columns[bias.bias_value], temperature_k, label=observable.name,
+        )
     recrossings = count_recrossings(series, low, high)
     kt = _KB_KJ_PER_MOL_K * temperature_k
-    delta_g = _delta_g(final, low, high, kt)
+    delta_g = delta_g_kj_per_mol(final, low, high, temperature_k)
+    # Stationarity check on the reweighting: the last half of the run against
+    # the whole. A gap above kT means the bias was still moving the weights.
+    half = series.size // 2
+    late = reweighted_profile(
+        series[half:], colvar_columns[bias.bias_value][half:], temperature_k,
+        label=observable.name,
+    )
+    delta_g_late = delta_g_kj_per_mol(late, low, high, temperature_k)
 
-    converged = drift is not None and drift < kt and recrossings >= min_recrossings
+    # The half-way drift is the campaign's per-round test and is reported, but
+    # a reference that spent its first third trapped keeps moving for a long
+    # time afterwards; what has to hold is that it has *stopped*: the surface
+    # over the last fifth of the run within kT of the final one, and the
+    # reweighted ΔG over the last half within kT of the whole-run value.
+    tail = load_fes(surfaces[int(0.8 * len(surfaces)) - 1]) if len(surfaces) >= 5 else None
+    drift_tail = fes_drift_kj_per_mol(tail, final_biased) if tail is not None else None
+    dg_gap = (
+        abs(delta_g - delta_g_late)
+        if delta_g is not None and delta_g_late is not None else None
+    )
+    converged = (
+        drift_tail is not None and drift_tail < kt
+        and dg_gap is not None and dg_gap < kt
+        and recrossings >= min_recrossings
+    )
     summary: dict[str, Any] = {
         "task_file": str(task_file),
         "task_sha256": task.sha256,
         "observable": observable.name,
+        "bias_cv": ",".join(bias.cv_labels),
         "state_thresholds": [low, high],
         "seed": seed,
         "biased_ns": n_chunks * chunk_ns,
-        "sigma": bias.sigma[0],
-        "sigma_floored": bias.sigma_floored,
+        "sigma": list(bias.sigma),
+        "sigma_floored": getattr(bias, "sigma_floored", None),
         "height_kj_per_mol": bias.height,
         "pace": bias.pace,
         "bias_factor": bias.bias_factor,
@@ -194,9 +309,12 @@ def build_reference(
         "n_hills": n_hills,
         "n_fes_estimates": len(surfaces),
         "fes_drift_kj_per_mol": drift,
+        "fes_drift_last_fifth_kj_per_mol": drift_tail,
         "recrossings": recrossings,
         "min_recrossings": min_recrossings,
-        "delta_g_unfolded_minus_folded_kj_per_mol": delta_g,
+        # F(unfolded) - F(folded): positive means the hairpin is the stable state.
+        "delta_g_low_minus_high_kj_per_mol": delta_g,
+        "delta_g_low_minus_high_last_half_kj_per_mol": delta_g_late,
         "observable_min": float(series.min()),
         "observable_max": float(series.max()),
         "converged": converged,
@@ -205,29 +323,20 @@ def build_reference(
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "reference.json").write_text(json.dumps(summary, indent=2))
     if converged:
-        shutil.copy2(surfaces[-1], data_dir / "reference_fes.dat")
+        write_fes(final, data_dir / "reference_fes.dat")
         _log(f"reference written: drift={drift:.2f} kJ/mol, recrossings={recrossings}, "
-             f"dG(unfolded - folded)={delta_g:.2f} kJ/mol")
+             f"dG(unfolded - folded)={delta_g} kJ/mol")
     else:
         (data_dir / "reference_fes.dat").unlink(missing_ok=True)
-        _log(f"NOT converged: drift={drift} kJ/mol (kT={kt:.2f}), "
+        _log(f"NOT converged: drift(half)={drift} drift(last fifth)={drift_tail} kJ/mol "
+             f"(kT={kt:.2f}), dG={delta_g} vs last-half {delta_g_late}, "
              f"recrossings={recrossings} (need {min_recrossings}); no reference written. "
              f"Re-run with a larger --ns to continue from the last chunk.")
     return summary
 
 
-def _delta_g(fes, low: float, high: float, kt: float) -> float | None:
-    """F(unfolded) - F(folded) from the surface, by integrating the populations.
-
-    Positive means the folded state (observable above `high`) is more stable.
-    Returns None when either state has no grid points in the sampled surface.
-    """
-    p = np.exp(-(fes.free_energy - fes.free_energy.min()) / kt)
-    folded = p[fes.cv >= high].sum()
-    unfolded = p[fes.cv <= low].sum()
-    if folded <= 0 or unfolded <= 0:
-        return None
-    return float(-kt * np.log(unfolded / folded))
+def _in_observable_units(fes: FreeEnergySurface, factor: float) -> FreeEnergySurface:
+    return FreeEnergySurface(fes.cv_label, fes.cv * factor, fes.free_energy, fes.periodic)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -237,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=_REFERENCE_SEED)
     parser.add_argument("--min-recrossings", type=int, default=4,
                         help="transitions the reference itself must show")
+    parser.add_argument("--bias", choices=["observable", "rmsd", "pbmetad"], default="observable",
+                        help="what to bias; the surface is on the observable either way")
     parser.add_argument("--dry-run", action="store_true",
                         help="0.05 ns in 0.01 ns chunks into a scratch dir; proves the "
                              "pipeline, produces no reference")
@@ -245,12 +356,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         summary = build_reference(
             total_ns=0.05, chunk_ns=0.01, seed=args.seed, min_recrossings=1,
-            data_dir=_DATA_DIR / "dryrun",
+            bias_cv=args.bias, data_dir=_DATA_DIR / "dryrun",
         )
     else:
         summary = build_reference(
             total_ns=args.ns, chunk_ns=args.chunk_ns, seed=args.seed,
-            min_recrossings=args.min_recrossings,
+            min_recrossings=args.min_recrossings, bias_cv=args.bias,
         )
     print(json.dumps(summary, indent=2))
     return 0 if summary["converged"] or args.dry_run else 1

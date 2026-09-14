@@ -272,6 +272,90 @@ class MetadynamicsBias:
 
 
 @dataclass(frozen=True)
+class ParallelBias:
+    """Parallel-bias well-tempered metadynamics on several CVs (PLUMED ``PBMETAD``).
+
+    One low-dimensional bias per CV, deposited in parallel and coupled through
+    the Boltzmann weights of the CVs' instantaneous biases, so each converges
+    to its own *marginal* free energy rather than to a joint surface that
+    would take exponentially longer to fill. Used for reference generation:
+    a single 1-D bias on a coordinate orthogonal to the true barrier piles up
+    bias in the basin it cannot leave — CLN025 refolding under a bias on
+    contacts or on RMSD did exactly that — and covering several coordinates
+    at once is the standard remedy.
+
+    ``hills_files`` is one HILLS file per CV; ``plumed sum_hills`` on any one
+    of them gives that CV's marginal, well-tempered-rescaled like ``METAD``'s.
+    Same parameter conventions as `MetadynamicsBias`.
+
+    ``grid`` is one ``(min, max)`` per CV. Without it PLUMED re-sums every
+    deposited hill at every step, so the cost grows linearly with the run —
+    a 20 ns reference had doubled its per-nanosecond time by 20 ns and was
+    CPU-bound with the GPU idling. With a grid the bias is tabulated and the
+    cost is constant; the bounds must enclose every hill centre PLUMED will
+    ever deposit, so leave room past the walls. Spacing is PLUMED's default,
+    SIGMA/5. Existing hills are read onto the grid on RESTART, so a run can
+    gain a grid mid-way.
+    """
+
+    cv_labels: tuple[str, ...]
+    sigma: tuple[float, ...]
+    height: float
+    pace: int
+    bias_factor: float = 10.0
+    temperature_k: float = 300.0
+    hills_prefix: str = "HILLS"
+    bias_label: str = "pb"
+    grid: tuple[tuple[float, float], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.cv_labels) != len(self.sigma):
+            raise ValueError(
+                f"pbmetad: cv_labels and sigma must have same length "
+                f"({len(self.cv_labels)} vs {len(self.sigma)})"
+            )
+        if len(self.cv_labels) < 2:
+            raise ValueError("pbmetad: at least two CVs; use MetadynamicsBias for one")
+        if self.height <= 0 or self.pace <= 0:
+            raise ValueError("pbmetad: height and pace must be positive")
+        if self.bias_factor <= 1.0:
+            raise ValueError("pbmetad: bias_factor (γ) must be > 1")
+        if self.temperature_k <= 0:
+            raise ValueError("pbmetad: temperature_k must be positive")
+        if self.grid is not None:
+            if len(self.grid) != len(self.cv_labels):
+                raise ValueError(
+                    f"pbmetad: grid needs one (min, max) per CV "
+                    f"({len(self.grid)} vs {len(self.cv_labels)})"
+                )
+            for label, (lo, hi) in zip(self.cv_labels, self.grid, strict=True):
+                if not hi > lo:
+                    raise ValueError(f"pbmetad: grid for {label} must have max > min")
+
+    @property
+    def hills_files(self) -> tuple[str, ...]:
+        return tuple(f"{self.hills_prefix}.{label}" for label in self.cv_labels)
+
+    def render(self) -> str:
+        line = (
+            f"{self.bias_label}: PBMETAD ARG={','.join(self.cv_labels)} "
+            f"SIGMA={','.join(f'{s:g}' for s in self.sigma)} HEIGHT={self.height:g} "
+            f"PACE={self.pace} BIASFACTOR={self.bias_factor:g} TEMP={self.temperature_k:g} "
+            f"FILE={','.join(self.hills_files)}"
+        )
+        if self.grid is not None:
+            line += (
+                f" GRID_MIN={','.join(f'{lo:g}' for lo, _ in self.grid)}"
+                f" GRID_MAX={','.join(f'{hi:g}' for _, hi in self.grid)}"
+            )
+        return line
+
+    @property
+    def bias_value(self) -> str:
+        return f"{self.bias_label}.bias"
+
+
+@dataclass(frozen=True)
 class HarmonicRestraint:
     """Harmonic restraint on a single CV — used for umbrella sampling
     windows and as the simplest PLUMED bias (handy for smoke tests)."""
@@ -343,7 +427,7 @@ class UpperWall:
         )
 
 
-Bias = Union[MetadynamicsBias, HarmonicRestraint]
+Bias = Union[MetadynamicsBias, ParallelBias, HarmonicRestraint]
 
 
 _RESTART_DIRECTIVE = "RESTART"
@@ -423,17 +507,22 @@ class PlumedInput:
             )
 
     def _bias_cv_labels(self) -> set[str]:
-        if isinstance(self.bias, MetadynamicsBias):
+        if isinstance(self.bias, (MetadynamicsBias, ParallelBias)):
             return set(self.bias.cv_labels)
         return {self.bias.cv_label}
 
     def _bias_with_resolved_paths(self) -> Bias:
-        """Rebind the bias's output file under `output_dir`. The bias renders
+        """Rebind the bias's output file(s) under `output_dir`. The bias renders
         itself, so the directory has to be pushed into it before rendering."""
         if isinstance(self.bias, MetadynamicsBias):
             return replace(
                 self.bias,
                 hills_file=str(Path(self.output_dir) / self.bias.hills_file),
+            )
+        if isinstance(self.bias, ParallelBias):
+            return replace(
+                self.bias,
+                hills_prefix=str(Path(self.output_dir) / self.bias.hills_prefix),
             )
         return self.bias
 

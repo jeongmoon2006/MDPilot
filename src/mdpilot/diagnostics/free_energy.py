@@ -335,6 +335,86 @@ def count_recrossings(cv_series: np.ndarray, low: float, high: float) -> int:
     return crossings
 
 
+def write_fes(fes: FreeEnergySurface, path: Path) -> Path:
+    """Write a surface in the `sum_hills` text layout, so `load_fes` reads it back."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"#! FIELDS {fes.cv_label} file.free", f"#! SET periodic {str(fes.periodic).lower()}"]
+    lines += [f"{c:.6f} {f:.6f}" for c, f in zip(fes.cv, fes.free_energy, strict=True)]
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def reweighted_profile(
+    observable: np.ndarray,
+    bias_kj_per_mol: np.ndarray,
+    temperature_k: float = _DEFAULT_TEMPERATURE_K,
+    *,
+    n_bins: int = 60,
+    label: str = "observable",
+) -> FreeEnergySurface:
+    """Free energy along the campaign observable, reweighted out of the bias.
+
+    The surface `sum_hills` integrates is along whichever CV the scientist
+    chose to bias — and after a `switch_cv` the campaign has two of those. The
+    task's states live on the campaign observable, so that is the coordinate a
+    reference has to be compared on. Each frame is reweighted by exp(V/kT)
+    with V the bias acting when it was sampled, then histogrammed; empty bins
+    are dropped rather than reported as infinite. With `--mintozero` semantics:
+    the minimum is 0.
+
+    This is the plain instantaneous-bias reweighting. The well-tempered
+    time-dependent offset c(t) is a constant within any one frame and only
+    shifts weights between early and late frames; over a run that has stopped
+    depositing it is negligible, and the campaign's own drift test is what
+    says whether that holds.
+    """
+    observable = np.asarray(observable, dtype=float).ravel()
+    bias_kj_per_mol = np.asarray(bias_kj_per_mol, dtype=float).ravel()
+    if observable.size != bias_kj_per_mol.size:
+        raise ValueError(
+            f"reweighted_profile: {observable.size} observable frames but "
+            f"{bias_kj_per_mol.size} bias values"
+        )
+    kt = _KB_KJ_PER_MOL_K * temperature_k
+    # Subtract the maximum before exponentiating: the deposited bias runs to
+    # tens of kT and exp() would overflow.
+    weights = np.exp((bias_kj_per_mol - bias_kj_per_mol.max()) / kt)
+    edges = np.linspace(observable.min(), observable.max(), n_bins + 1)
+    hist, _ = np.histogram(observable, bins=edges, weights=weights)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    populated = hist > 0
+    free_energy = -kt * np.log(hist[populated])
+    return FreeEnergySurface(
+        cv_label=label,
+        cv=centers[populated],
+        free_energy=free_energy - free_energy.min(),
+        periodic=False,
+    )
+
+
+def delta_g_kj_per_mol(
+    fes: FreeEnergySurface,
+    low: float,
+    high: float,
+    temperature_k: float = _DEFAULT_TEMPERATURE_K,
+) -> float | None:
+    """F(low state) - F(high state), from the populations the surface implies.
+
+    Positive means the high state (observable above `high`) is the more
+    stable one. Integrates exp(-F/kT) over each state rather than reading the
+    two minima, so a broad shallow basin counts for what it holds. None when
+    either state has no grid points on the surface.
+    """
+    kt = _KB_KJ_PER_MOL_K * temperature_k
+    p = np.exp(-(fes.free_energy - fes.free_energy.min()) / kt)
+    p_low = p[fes.cv <= low].sum()
+    p_high = p[fes.cv >= high].sum()
+    if p_low <= 0 or p_high <= 0:
+        return None
+    return float(-kt * np.log(p_low / p_high))
+
+
 def _baseline_index(n_surfaces: int) -> int:
     """Index of the estimate to measure drift *against*, given `n_surfaces`.
 

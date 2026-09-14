@@ -1472,9 +1472,9 @@ def test_an_unresolvable_proposal_becomes_an_extend_on_record(
     assert rows[0].metad_proposal is None            # nothing for a resume to rebuild
     assert result.stop_reason == "scientist_said_stop"
     notes = [n.text for n in store.list_ledger_notes(tmp_path) if n.round_index == 1]
-    assert any("proposal refused" in n and "resolved to 0 atoms" in n for n in notes)
+    assert any("decision refused" in n and "resolved to 0 atoms" in n for n in notes)
     overrides = [p["note"] for name, p in events if name == "override"]
-    assert len(overrides) == 1 and "proposal refused" in overrides[0]
+    assert len(overrides) == 1 and "decision refused" in overrides[0]
 
 
 def test_the_proposal_validator_resolves_against_the_campaign_topology(
@@ -1651,3 +1651,156 @@ def test_wall_notes_lost_to_a_crash_are_written_on_the_pivot_resume(
 
     texts = [n.text for n in store.list_ledger_notes(tmp_path) if n.round_index == 1]
     assert texts == ["WARNING: already on record", "WARNING: wall beyond the box"]
+
+
+# ---------- the trap seen from the other side ----------
+
+def _write_obs(rounds_dir: Path, index: int, lo: float, hi: float) -> None:
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    np.save(rounds_dir / f"round_{index:03d}.obs.npy", np.linspace(lo, hi, 50))
+
+
+def test_rounds_since_visited_counts_the_walker_that_never_comes_back(tmp_path: Path) -> None:
+    """The real campaign: unfolded in round 2, then three rounds at Q in
+    [0.03, 0.55] — below the folded threshold every frame, straddling the
+    unfolded one — with `rounds_confined=0` throughout."""
+    rounds = tmp_path / "rounds"
+    _write_obs(rounds, 2, 0.157, 0.811)   # visited both states
+    _write_obs(rounds, 3, 0.026, 0.550)
+    _write_obs(rounds, 4, 0.030, 0.547)
+    _write_obs(rounds, 5, 0.164, 0.529)   # dips into unfolded, never above 0.7
+
+    assert loop_mod._confinement(rounds, 5, (0.3, 0.7)) == (None, 0)          # the old signal
+    assert loop_mod._rounds_since_visited(rounds, 5, (0.3, 0.7)) == (0, 3)     # the new one
+    assert loop_mod._rounds_since_visited(rounds, 2, (0.3, 0.7)) == (0, 0)
+    assert loop_mod._rounds_since_visited(rounds, 5, None) == (None, None)
+
+
+def test_rounds_since_visited_stops_at_the_pivot(tmp_path: Path) -> None:
+    rounds = tmp_path / "rounds"
+    _write_obs(rounds, 2, 0.4, 0.6)       # round 1 was vanilla: no file
+    _write_obs(rounds, 3, 0.4, 0.6)
+
+    assert loop_mod._rounds_since_visited(rounds, 3, (0.3, 0.7)) == (2, 2)
+
+
+def test_a_misquoted_report_becomes_an_extend_with_the_note_withheld(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mdpilot.orchestrator.scientist import MisquotedReport
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    scripted = loop_mod.decide
+    misread = Decision(
+        decision="stop", reason="recrossings rose to 2", extra_ns=None,
+        ledger_note="crossing requirement satisfied",
+        cited=(("recrossings", 2),),
+    )
+    calls = {"n": 0}
+
+    def refuse_first(report, **kwargs):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise MisquotedReport(misread, "`recrossings`: cited 2, report says 1", 3)
+        return scripted(report, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "decide", refuse_first)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    rows = store.list_rounds(tmp_path)
+    assert [r.decision for r in rows] == ["extend", "stop"]
+    notes = [n.text for n in store.list_ledger_notes(tmp_path) if n.round_index == 1]
+    assert notes == [notes[0]]                                   # exactly one
+    assert "decision refused" in notes[0] and "cited 2, report says 1" in notes[0]
+    assert "crossing requirement satisfied" not in notes[0]      # the misread note never landed
+
+
+def test_the_round_json_keeps_what_the_model_said_it_read(tmp_path: Path, monkeypatch) -> None:
+    import json
+
+    _stub_collaborators(monkeypatch, [
+        Decision(decision="stop", reason="ess=5", extra_ns=None, cited=(("ess", 5.0),)),
+    ])
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        **_run_kwargs(),
+    )
+
+    payload = json.loads((tmp_path / "rounds" / "round_001.json").read_text())
+    assert payload["decision"]["cited"] == [{"field": "ess", "value": 5.0}]
+
+
+# ---------- the surface on the campaign observable ----------
+
+def test_the_observable_is_printed_in_colvar_beside_the_biased_cv(tmp_path: Path) -> None:
+    """Whatever CV the scientist biases, PLUMED also evaluates the campaign
+    observable every step, unbiased, so the surface along it can be reweighted
+    from the same COLVAR row as the bias."""
+    from mdpilot.observables import COLVAR_OBSERVABLE_LABEL, ObservableSpec
+
+    traj, top = _two_atom_traj(tmp_path)
+    biased = MetadProposal(cv_type="distance", selections=("index 0", "index 1"), label="d")
+    text = loop_mod._build_plumed_input(
+        biased, traj, top, tmp_path, temperature_k=300.0,
+        observable=ObservableSpec(cv_type="distance", selections=("index 0", "index 1"),
+                                  name="d_nm"),
+    )
+
+    assert f"{COLVAR_OBSERVABLE_LABEL}: DISTANCE" in text
+    assert f"PRINT ARG=d,{COLVAR_OBSERVABLE_LABEL},metad.bias" in text
+    assert "METAD ARG=d " in text                            # still biased on the proposal alone
+
+
+def test_a_biased_round_reports_the_surface_on_the_observable(tmp_path: Path, monkeypatch) -> None:
+    """From COLVAR's observable and bias columns the biased report carries a
+    reweighted surface *on the observable* and the free-energy difference
+    between the task's states on it — the numbers a reference is compared
+    against, whatever CV is being biased."""
+    from mdpilot.diagnostics.free_energy import load_fes
+    from mdpilot.observables import ObservableSpec
+
+    _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    rng = np.random.default_rng(1)
+
+    def fake_accumulated(rounds_dir, round_index, trajectory_path, topology_path, observable=None):  # noqa: ANN001
+        series = rng.uniform(0.0, 1.0, 2)
+        return series, "q", series
+
+    monkeypatch.setattr(loop_mod, "_accumulated_observable", fake_accumulated)
+    written: dict = {}
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        # A COLVAR PLUMED would have written: the biased CV, the observable
+        # (a CA-CA distance here, printed in nm) and the bias, 1 ps rows.
+        rows = ["#! FIELDS time rg observable metad.bias"] + [
+            f"{200 + i:.6f} 0.5 {0.3 + 0.1 * i:.6f} {2.0 * i:.6f}" for i in range(0, 5)
+        ]
+        (tmp_path / "COLVAR").write_text("\n".join(rows) + "\n")
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        task_expectation="fold it", state_thresholds=(3.0, 7.0),
+        # the observable is that distance in Angstrom: PLUMED's nm column x 10
+        observable=ObservableSpec(cv_type="distance", selections=("index 0", "index 1"),
+                                  name="d_angstrom", scale=10.0),
+        max_rounds=3,
+        **_run_kwargs(),
+    )
+
+    report = result.rounds[1].report
+    assert report["phase"] == "metad"
+    surface = load_fes(Path(report["observable_fes_path"]))
+    assert surface.cv_label == "d_angstrom"
+    assert 3.0 <= surface.cv.min() and surface.cv.max() <= 7.0     # 0.3-0.7 nm, in Angstrom
+    assert surface.free_energy.min() == 0.0
+    assert "delta_g_low_minus_high_kj_per_mol" in report
+    written.update(report)

@@ -343,3 +343,49 @@ def test_contacts_rejects_a_nonpositive_r0() -> None:
 
     with _pytest.raises(ValueError, match="r0_nm must be positive"):
         ContactsCV(label="q", pairs=((0, 5),), r0_nm=0.0)
+
+
+# ---------- parallel-bias metadynamics ----------
+
+def test_parallel_bias_renders_one_hills_file_per_cv(tmp_path: Path) -> None:
+    from mdpilot.adapters.plumed_writer import DistanceCV, GyrationCV, ParallelBias, PlumedInput
+
+    cvs = (DistanceCV("d", (0, 1)), GyrationCV("rg", (0, 1, 2)))
+    bias = ParallelBias(cv_labels=("d", "rg"), sigma=(0.02, 0.03), height=1.2, pace=500)
+    text = PlumedInput(cvs=cvs, bias=bias, output_dir=tmp_path.resolve()).render()
+
+    line = next(ln for ln in text.splitlines() if ln.startswith("pb: PBMETAD"))
+    assert "ARG=d,rg" in line and "SIGMA=0.02,0.03" in line and "BIASFACTOR=10" in line
+    assert f"FILE={tmp_path.resolve() / 'HILLS.d'},{tmp_path.resolve() / 'HILLS.rg'}" in line
+    assert "PRINT ARG=d,rg,pb.bias" in text
+
+
+def test_parallel_bias_needs_two_cvs_and_matching_sigmas() -> None:
+    from mdpilot.adapters.plumed_writer import ParallelBias
+
+    with pytest.raises(ValueError, match="at least two"):
+        ParallelBias(cv_labels=("d",), sigma=(0.02,), height=1.0, pace=500)
+    with pytest.raises(ValueError, match="same length"):
+        ParallelBias(cv_labels=("d", "rg"), sigma=(0.02,), height=1.0, pace=500)
+
+
+def test_parallel_bias_referencing_an_undefined_cv_is_refused(tmp_path: Path) -> None:
+    from mdpilot.adapters.plumed_writer import DistanceCV, ParallelBias, PlumedInput
+
+    bias = ParallelBias(cv_labels=("d", "ghost"), sigma=(0.02, 0.02), height=1.0, pace=500)
+    with pytest.raises(ValueError, match="undefined CV"):
+        PlumedInput(cvs=(DistanceCV("d", (0, 1)),), bias=bias, output_dir=tmp_path.resolve())
+
+
+def test_parallel_bias_grid_renders_bounds_per_cv(tmp_path: Path) -> None:
+    from mdpilot.adapters.plumed_writer import ParallelBias
+
+    bias = ParallelBias(cv_labels=("d", "rg"), sigma=(0.02, 0.03), height=1.2, pace=500,
+                        grid=((-0.1, 1.5), (0.2, 2.0)))
+    assert "GRID_MIN=-0.1,0.2 GRID_MAX=1.5,2" in bias.render()
+    with pytest.raises(ValueError, match="one \\(min, max\\) per CV"):
+        ParallelBias(cv_labels=("d", "rg"), sigma=(0.02, 0.03), height=1.2, pace=500,
+                     grid=((-0.1, 1.5),))
+    with pytest.raises(ValueError, match="max > min"):
+        ParallelBias(cv_labels=("d", "rg"), sigma=(0.02, 0.03), height=1.2, pace=500,
+                     grid=((-0.1, 1.5), (2.0, 0.2)))

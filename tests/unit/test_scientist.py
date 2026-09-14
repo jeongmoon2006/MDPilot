@@ -15,7 +15,9 @@ import pytest
 from mdpilot.orchestrator.scientist import (
     Decision,
     MetadProposal,
+    MisquotedReport,
     UnresolvableProposal,
+    check_citations,
     decide,
 )
 
@@ -699,3 +701,91 @@ def test_the_extension_ceiling_reaches_the_model() -> None:
     assert '"max_extra_ns": 0.75' in fake.last_request["messages"][0]["content"]
     rule = _paragraph_containing(_system_text(fake), "`max_extra_ns`")
     assert "ceiling" in rule.lower()
+
+
+# ---------- cited numbers are checked against the report ----------
+
+_R5 = {"recrossings": 1, "fes_drift_kj_per_mol": 24.648631505743722,
+       "barrier_kj_per_mol": 12.325174823, "fes_converged": False, "phase": "metad",
+       "confined_to_state": None, "cv_label": "native_contacts_fraction"}
+
+
+def test_every_decision_tool_requires_cited() -> None:
+    from mdpilot.orchestrator import scientist as s
+
+    for tool in (s._DECISION_TOOL, s._CONVERGENCE_TOOL, s._METAD_DECISION_TOOL,
+                 s._METAD_SWITCH_TOOL):
+        schema = tool["input_schema"]
+        assert "cited" in schema["properties"], tool["description"]
+        assert "cited" in schema["required"], tool["description"]
+
+
+def test_rounding_is_not_misreading_but_a_wrong_count_is() -> None:
+    assert check_citations((("fes_drift_kj_per_mol", 24.6),), _R5) is None
+    assert check_citations((("barrier_kj_per_mol", 12),), _R5) is None
+    assert check_citations((("fes_converged", False), ("confined_to_state", None)), _R5) is None
+
+    error = check_citations((("recrossings", 2),), _R5)          # the real round-5 misquote
+    assert error is not None and "cited 2" in error and "report says 1" in error
+    assert check_citations((("fes_converged", True),), _R5)
+    assert "no such field" in (check_citations((("ess", 177.0),), _R5) or "")
+
+
+def test_string_fields_are_checked_exactly_or_not_at_all() -> None:
+    """The dry-run: the model cited `confined_to_state` as null because the
+    schema could not carry "high", the check refused it three times, and a
+    correct `switch_cv` became an extend. Strings are compared only when the
+    model actually quotes one."""
+    report = {**_R5, "confined_to_state": "high", "cv_label": "native_contacts_fraction"}
+    assert check_citations((("confined_to_state", "high"),), report) is None
+    assert check_citations((("confined_to_state", None),), report) is None       # schema-forced null
+    assert check_citations((("confined_to_state", 2),), report) is None          # not a number to misread
+    error = check_citations((("confined_to_state", "low"),), report)
+    assert error is not None and "report says 'high'" in error
+    # a null report value still has to be cited as null
+    assert check_citations((("confined_to_state", "high"),), _R5)
+
+
+def test_the_cited_value_schema_admits_strings() -> None:
+    from mdpilot.orchestrator.scientist import _CITED_SCHEMA
+
+    assert "string" in _CITED_SCHEMA["items"]["properties"]["value"]["type"]
+
+
+def test_a_misquoted_number_is_sent_back_with_both_values() -> None:
+    misread = {"decision": "extend", "reason": "recrossings rose to 2", "extra_ns": 1.0,
+               "ledger_note": "crossing requirement satisfied",
+               "cited": [{"field": "recrossings", "value": 2}]}
+    corrected = {**misread, "reason": "recrossings still 1", "ledger_note": None,
+                 "cited": [{"field": "recrossings", "value": 1}]}
+    fake = _SequenceClient([misread, corrected])
+
+    result = decide(_R5, phase="metad", client=fake)
+
+    assert result.cited == (("recrossings", 1),)
+    assert result.ledger_note is None
+    feedback = fake.requests[1]["messages"][2]["content"][0]
+    assert feedback["is_error"] is True
+    assert "cited 2" in feedback["content"] and "report says 1" in feedback["content"]
+
+
+def test_a_persistent_misquote_raises_after_the_allowance() -> None:
+    misread = {"decision": "stop", "reason": "done", "extra_ns": None, "ledger_note": "n",
+               "cited": [{"field": "recrossings", "value": 2}]}
+    fake = _SequenceClient([misread] * 3)
+
+    with pytest.raises(MisquotedReport) as info:
+        decide(_R5, phase="metad", client=fake, max_attempts=3)
+
+    assert info.value.attempts == 3
+    assert info.value.decision.decision == "stop"
+    assert "recrossings" in info.value.error
+
+
+def test_the_citation_rule_is_in_every_prompt() -> None:
+    for kwargs in ({}, {"task_expectation": "x"}, {"phase": "metad"},
+                   {"phase": "metad", "allow_cv_switch": True}):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        rule = _paragraph_containing(_system_text(fake), "For `cited`")
+        assert "checked" in rule

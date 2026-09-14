@@ -146,9 +146,13 @@ mdpilot/
 ├── benchmarks/
 │   ├── tasks/
 │   │   ├── trpcage_convergence.yaml   # M1 convergence-judgment task
-│   │   └── cln025_folding.yaml        # M4 done-criterion task
+│   │   ├── cln025_folding.yaml        # M4 done-criterion task
+│   │   └── cln025_contacts.yaml       # the end-to-end case (judged on native contacts)
 │   ├── generate_trpcage_planted.py    # planted reference trajectories
-│   └── run_cln025.py                  # M4 campaign runner + done-criterion check
+│   ├── generate_cln025_reference.py   # long metaD on the observable -> reference surface
+│   ├── run_cln025.py                  # M4 campaign runner + done-criterion check
+│   └── run_cln025_e2e.py              # launch / detect / correct / recover, scored
+│                                      #   against the reference and the literature
 │
 ├── tests/
 │   ├── unit/

@@ -27,6 +27,16 @@ and cannot lead it back. Prefer a replacement that separates the states on the
 side you are stuck in — an `rmsd` with an upper wall, or a `gyration`, both of
 which still distinguish disordered structures a contact count cannot.
 
+- **the walker is not coming back**: `rounds_since_high_visited` (or
+`_low_`) is 3 or more on the state the walker started from, while
+`fes_depth_kj_per_mol` keeps rising. A real campaign unfolded in its second
+biased round and then spent three rounds at Q between 0.03 and 0.55 — below
+the folded threshold every frame, above the unfolded one often enough that
+`rounds_confined` never fired — while the surface deepened past 30 kJ/mol.
+The per-round range looked like exploration; it was a coordinate that could
+not lead the system back. The bias on this coordinate has been given several
+rounds to return the walker and has not; more of it will not.
+
 `cv_switches_remaining` says how many revisions the campaign has left. When it
 reaches 0 the action disappears from your tool; spend one on a coordinate you
 have evidence against, not on a surface that is merely still filling.

@@ -44,13 +44,26 @@ from mdpilot.adapters.base import MDAdapter
 from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
 from mdpilot.adapters.system_spec import SystemSpec
-from mdpilot.diagnostics.free_energy import metad_report
+from mdpilot.diagnostics.free_energy import (
+    delta_g_kj_per_mol,
+    load_colvar,
+    metad_report,
+    reweighted_profile,
+    write_fes,
+)
 from mdpilot.diagnostics.report import make_report
 from mdpilot import preflight
-from mdpilot.observables import ObservableSpec, campaign_observable
+from mdpilot.observables import (
+    COLVAR_OBSERVABLE_LABEL,
+    ObservableSpec,
+    campaign_observable,
+    colvar_to_observable_factor,
+    observable_cv_proposal,
+)
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import (
     Decision,
+    DecisionRefused,
     MetadProposal,
     UnresolvableProposal,
     decide,
@@ -423,6 +436,7 @@ def run_campaign(
             cv_upper_wall_nm=cv_upper_wall_nm,
             bias_pace=bias_pace,
             bias_factor=bias_factor,
+            observable=observable,
             notes=wall_notes,
         )
         in_metad = True
@@ -457,6 +471,7 @@ def run_campaign(
             cv_upper_wall_nm=cv_upper_wall_nm,
             bias_pace=bias_pace,
             bias_factor=bias_factor,
+            observable=observable,
             notes=wall_notes,
         )
         in_metad = True
@@ -596,8 +611,8 @@ def run_campaign(
                 max_extra_ns=max_extra_ns,
                 validate_proposal=validate_proposal,
             )
-        except UnresolvableProposal as refused:
-            decision, override_note = _refuse_unresolvable_proposal(refused)
+        except DecisionRefused as refused:
+            decision, override_note = _refuse_decision(refused)
 
         if in_metad:
             remaining = (
@@ -674,6 +689,7 @@ def run_campaign(
                 cv_upper_wall_nm=cv_upper_wall_nm,
                 bias_pace=bias_pace,
                 bias_factor=bias_factor,
+                observable=observable,
                 notes=wall_notes,
             )
             in_metad = True
@@ -706,6 +722,7 @@ def run_campaign(
                 cv_upper_wall_nm=cv_upper_wall_nm,
                 bias_pace=bias_pace,
                 bias_factor=bias_factor,
+                observable=observable,
                 notes=wall_notes,
             )
             cv_switches_used += 1
@@ -864,6 +881,12 @@ def _round_report(
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
 
+    A biased round also carries the free-energy surface *along the campaign
+    observable*, reweighted from COLVAR — the surface the task's states are
+    defined on, whatever CV is being biased, and the one a reference is
+    compared against. PLUMED prints the observable on every COLVAR row beside
+    the bias, so no trajectory frame has to be placed on its clock.
+
     A vanilla round gets the equilibrium convergence bundle. A biased round
     gets the free-energy bundle instead — *instead*, not alongside. The
     equilibrium statistics describe an equilibrium ensemble, and a biased
@@ -924,6 +947,31 @@ def _round_report(
         )
         report["confined_to_state"] = confined
         report["rounds_confined"] = rounds_confined
+        # The other face of the trap. `rounds_confined` fires when a round sits
+        # entirely inside one state; a walker that roams the disordered region
+        # without ever re-entering the state it started from never trips it.
+        # A real campaign sat at Q in [0.03, 0.55] for three rounds — below the
+        # folded threshold of 0.7 every frame, straddling the unfolded one at
+        # 0.3 — and reported `rounds_confined=0` throughout while the scientist
+        # wrote "did not reach the folded state" three times and extended.
+        since_low, since_high = _rounds_since_visited(
+            rounds_dir, round_index, state_thresholds
+        )
+        report["rounds_since_low_visited"] = since_low
+        report["rounds_since_high_visited"] = since_high
+    colvar_path = bias_dir / _COLVAR_NAME
+    if state_thresholds is not None and colvar_path.exists():
+        profile = observable_surface_from_colvar(
+            colvar_path, topology_path, observable, temperature_k
+        )
+        if profile is not None:
+            report["observable_fes_path"] = str(
+                write_fes(profile, fes_dir / "observable_fes.dat")
+            )
+            low, high = float(state_thresholds[0]), float(state_thresholds[1])
+            report["delta_g_low_minus_high_kj_per_mol"] = delta_g_kj_per_mol(
+                profile, low, high, temperature_k
+            )
     # The CV-revision allowance, so the scientist can weigh a switch against
     # what is left rather than only discovering the action is gone.
     report["cv_switches_used"] = cv_switches_used
@@ -973,6 +1021,81 @@ def _confinement(
             break
         count += 1
     return state, count
+
+
+def observable_surface_from_colvar(
+    colvar_path: Path,
+    topology_path: Path,
+    observable: ObservableSpec | None,
+    temperature_k: float,
+) -> Any:
+    """The free-energy surface along the campaign observable, from COLVAR.
+
+    Reads the observable column PLUMED printed (`COLVAR_OBSERVABLE_LABEL`),
+    converts it to the observable's own units, and reweights it by the bias on
+    the same row. None when COLVAR carries no such column — a campaign
+    recorded before the observable was printed — or no bias column.
+
+    Public because the benchmark scorer reads finished campaigns off disk
+    with it.
+    """
+    spec = observable or ObservableSpec.ca_rmsd_angstrom()
+    colvar = load_colvar(colvar_path)
+    bias_column = next((k for k in colvar if k.endswith(".bias")), None)
+    if COLVAR_OBSERVABLE_LABEL not in colvar or bias_column is None:
+        return None
+    reference = md.load(str(topology_path))
+    with tempfile.TemporaryDirectory() as scratch:
+        cv = design_cv(
+            observable_cv_proposal(spec), reference.topology,
+            reference=reference, output_dir=Path(scratch),
+        )
+    return reweighted_profile(
+        colvar[COLVAR_OBSERVABLE_LABEL] * colvar_to_observable_factor(spec, cv),
+        colvar[bias_column],
+        temperature_k,
+        label=spec.name,
+    )
+
+
+def _rounds_since_visited(
+    rounds_dir: Path | None,
+    round_index: int | None,
+    state_thresholds: tuple[float, float] | None,
+) -> tuple[int | None, int | None]:
+    """Consecutive biased rounds, ending with this one, that never entered each state.
+
+    Returned as `(low, high)`. 0 means the walker entered that state this
+    round. Walks backwards over the per-round observable files exactly as
+    `_confinement` does, so the count stops at the pivot.
+
+    `None` when there is nothing to count against.
+    """
+    if rounds_dir is None or round_index is None or state_thresholds is None:
+        return None, None
+    low, high = float(state_thresholds[0]), float(state_thresholds[1])
+    since = {"low": 0, "high": 0}
+    open_ = {"low": True, "high": True}
+    for index in range(round_index, 0, -1):
+        path = rounds_dir / f"round_{index:03d}.obs.npy"
+        if not path.exists():
+            break
+        series = np.load(path)
+        if not series.size:
+            break
+        if open_["low"]:
+            if series.min() <= low:
+                open_["low"] = False
+            else:
+                since["low"] += 1
+        if open_["high"]:
+            if series.max() >= high:
+                open_["high"] = False
+            else:
+                since["high"] += 1
+        if not (open_["low"] or open_["high"]):
+            break
+    return since["low"], since["high"]
 
 
 def _accumulated_observable(
@@ -1042,27 +1165,38 @@ def _refuse_premature_stop(
     return replace(decision, decision="extend", extra_ns=decision.extra_ns or 0.5), note
 
 
-def _refuse_unresolvable_proposal(
-    refused: UnresolvableProposal,
-) -> tuple[Decision, str]:
-    """Convert a proposal the topology cannot resolve into an extend, on record.
+def _refuse_decision(refused: DecisionRefused) -> tuple[Decision, str]:
+    """Convert a decision `decide()` could not get right into an extend, on record.
 
-    `decide()` has already sent the resolution error back to the model
+    `decide()` has already sent the problem back to the model
     `refused.attempts` times. Raising here would lose the round's MD (nothing
     is persisted yet) and, worse, restart would re-run it into the same
-    proposal. Extending keeps the campaign moving under its current
-    Hamiltonian and writes the refusal to the ledger so the next round proposes
-    with the error in front of it — the same shape as `_refuse_premature_stop`.
+    answer. Extending keeps the campaign moving under its current Hamiltonian
+    and writes the refusal to the ledger so the next round decides with the
+    error in front of it — the same shape as `_refuse_premature_stop`.
+
+    Two refusals arrive here. A proposal the topology cannot resolve: the
+    proposal is dropped. Numbers cited that disagree with the report: the
+    model's own ledger note is withheld too, since it was written from the
+    misread values and the ledger is what every later round remembers.
     """
     d = refused.decision
+    what = (
+        "a CV the campaign topology cannot resolve"
+        if isinstance(refused, UnresolvableProposal)
+        else "numbers that disagree with the report it was given"
+    )
     note = (
-        f"proposal refused: the scientist chose {d.decision} with a CV the "
-        f"campaign topology cannot resolve, {refused.attempts} time(s) running "
-        f"({refused.error}). Converted to an extend; it may propose again next "
-        f"round. Reason given was: {d.reason}"
+        f"decision refused: the scientist chose {d.decision} citing {what}, "
+        f"{refused.attempts} time(s) running ({refused.error}). Converted to an "
+        f"extend; its ledger note for this round was withheld. Reason given "
+        f"was: {d.reason}"
     )
     return (
-        replace(d, decision="extend", extra_ns=d.extra_ns or 0.5, metad_proposal=None),
+        replace(
+            d, decision="extend", extra_ns=d.extra_ns or 0.5,
+            metad_proposal=None, ledger_note=None,
+        ),
         note,
     )
 
@@ -1158,6 +1292,7 @@ def _pivot_to_metad(
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
     bias_factor: float | None = None,
+    observable: ObservableSpec | None = None,
     notes: list[str] | None = None,
 ) -> MDAdapter:
     """Resolve a CV proposal into a biased, started adapter.
@@ -1177,6 +1312,7 @@ def _pivot_to_metad(
         cv_upper_wall_nm=cv_upper_wall_nm,
         bias_pace=bias_pace,
         bias_factor=bias_factor,
+        observable=observable,
         notes=notes,
     )
     plumed_dat_path.write_text(plumed_input)
@@ -1196,6 +1332,7 @@ def _build_plumed_input(
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
     bias_factor: float | None = None,
+    observable: ObservableSpec | None = None,
     notes: list[str] | None = None,
 ) -> str:
     """Proposal → resolved CV → sized bias → rendered plumed.dat text.
@@ -1203,6 +1340,10 @@ def _build_plumed_input(
     `notes` collects anything the scientist needs to know about the bias that
     the diagnostics cannot show it — currently the wall. plumed.dat records the
     same thing as comments, but the scientist never reads plumed.dat.
+
+    `observable`, when given, is resolved too and printed in COLVAR under
+    `COLVAR_OBSERVABLE_LABEL`, unbiased. That column is what the surface along
+    the observable is reweighted from.
 
     `output_dir` is where PLUMED writes HILLS and COLVAR. It has to be
     absolute and campaign-local: PLUMED resolves relative FILE= paths against
@@ -1242,8 +1383,18 @@ def _build_plumed_input(
     )
     if notes is not None:
         notes.extend(_wall_notes(cv, wall, cv_upper_wall_nm))
+    cvs: tuple[Any, ...] = (cv,)
+    if observable is not None:
+        cvs += (
+            design_cv(
+                observable_cv_proposal(observable),
+                reference.topology,
+                reference=reference,
+                output_dir=output_dir,
+            ),
+        )
     return PlumedInput(
-        cvs=(cv,),
+        cvs=cvs,
         bias=bias,
         walls=(wall,) if wall is not None else (),
         output_dir=Path(output_dir).resolve(),
@@ -1348,6 +1499,8 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
             # cumulative numbers say.
             observable_min_this_round=r.report.get("observable_min_this_round"),
             observable_max_this_round=r.report.get("observable_max_this_round"),
+            rounds_since_low_visited=r.report.get("rounds_since_low_visited"),
+            rounds_since_high_visited=r.report.get("rounds_since_high_visited"),
             # The boundaries move as the surface fills, so a count carried
             # forward without them is not comparable across rounds.
             recrossing_low=r.report.get("recrossing_low"),
@@ -1385,6 +1538,9 @@ def _persist_round_json(
             "metad_proposal": (
                 decision.metad_proposal.to_dict() if decision.metad_proposal else None
             ),
+            # What the model said it read, kept with the round so a reason can
+            # be audited against the numbers it claims to rest on.
+            "cited": [{"field": f, "value": v} for f, v in decision.cited],
         },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))

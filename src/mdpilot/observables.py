@@ -145,6 +145,42 @@ class ObservableSpec:
         )
 
 
+# The label under which PLUMED prints the campaign observable in COLVAR, beside
+# whichever CV is being biased. Fixed rather than the observable's own name:
+# the scientist may bias a CV it named identically, and PLUMED labels must be
+# unique.
+COLVAR_OBSERVABLE_LABEL = "observable"
+
+
+def observable_cv_proposal(spec: ObservableSpec) -> CVProposal:
+    """The observable as the CV proposal PLUMED can evaluate every step.
+
+    Printed in COLVAR so the free-energy surface *along the observable* can be
+    reweighted from the bias PLUMED records on the same row — no trajectory
+    frame has to be placed on COLVAR's clock, and there are five times as many
+    samples as frames. `rmsd` resolves through `design_cv` here like every
+    other type: PLUMED needs its reference as a file.
+    """
+    return CVProposal(
+        cv_type=spec.cv_type, selections=tuple(spec.selections),
+        label=COLVAR_OBSERVABLE_LABEL,
+    )
+
+
+def colvar_to_observable_factor(spec: ObservableSpec, cv: Any) -> float:
+    """Multiply PLUMED's column by this to get the observable in its own units.
+
+    PLUMED works in nm and radians and renders `contacts` as a fraction, so
+    the column is the raw CV; the observable is that times `scale`, and times
+    the pair count when a `contacts` observable is declared as a raw count.
+    `cv` is the resolved CV the column was rendered from.
+    """
+    factor = spec.scale
+    if spec.cv_type == "contacts" and not spec.normalize:
+        factor *= len(cv.pairs)
+    return factor
+
+
 def campaign_observable(
     traj: md.Trajectory,
     top_path: "Any",
