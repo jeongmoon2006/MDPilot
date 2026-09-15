@@ -300,19 +300,41 @@ def surface_deviation(a: FreeEnergySurface, b: FreeEnergySurface) -> dict[str, A
     }
 
 
+def _visited_range(work_dir: Path, biased: list[store.RoundRow]) -> tuple[float, float] | None:
+    """The observable's range over the biased phase, from the per-round files —
+    `sum_hills` grids past anything the walker visited."""
+    chunks = []
+    for r in biased:
+        path = work_dir / "rounds" / f"round_{r.round_index:03d}.obs.npy"
+        if path.exists():
+            chunks.append(np.load(path))
+    if not chunks:
+        return None
+    series = np.concatenate(chunks)
+    return float(series.min()), float(series.max())
+
+
 def _observable_surface(
     work_dir: Path, biased: list[store.RoundRow], task: TaskFile
 ) -> FreeEnergySurface | None:
-    """The reweighted surface on the observable after the last biased round.
+    """The surface on the observable after the last biased round.
 
-    Read from the round's report when the loop wrote one; otherwise rebuilt
-    from COLVAR. A campaign recorded before the loop printed the observable
-    there can still be scored when the CV it biased *is* the observable —
-    the column is then under the biased CV's own label.
+    When the primary biased coordinate *is* the campaign observable, its
+    `sum_hills` marginal is the surface: well-tempered-rescaled and cumulative
+    over the whole biased phase, including across an `add_cv` (the retained
+    hills are read back), where the reweighted surface only sees the COLVAR
+    written since the addition. Otherwise the reweighted surface the loop
+    wrote, or one rebuilt from COLVAR for older campaigns.
     """
     if not biased:
         return None
     last = biased[-1]
+    if last.report.get("cv_label") == task.observable_name:
+        fes_path = last.report.get("fes_path")
+        if fes_path and Path(fes_path).exists():
+            surface = load_fes(Path(fes_path))
+            visited = _visited_range(work_dir, biased)
+            return surface.restricted_to(*visited) if visited else surface
     path = last.report.get("observable_fes_path")
     if path and Path(path).exists():
         return load_fes(Path(path))

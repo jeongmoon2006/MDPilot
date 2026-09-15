@@ -401,6 +401,23 @@ Two facts from the end-to-end case (2026-09-14 journal) set this. Neither of the
 
 **2026-09-14, afternoon — redesign from the case: escalate to several coordinates, warm-start revisions (D11).** `add_cv` beside `switch_cv` on a shared allowance of two; PBMETAD with grids when the set has more than one; hills on retained coordinates kept across the addition; the walker carried across every pivot and revision as a State. 459 unit tests; the live escalation test proves the PLUMED and OpenMM halves. Dry-run with the model, then the campaign again.
 
+**2026-09-14, 14:15–19:05 — the campaign again, under D11.** Same task, same seed, same 20 ns. Twelve rounds, no refusals, every citation exact.
+
+| round | phase | ns | what the report said | decision |
+|---|---|---|---|---|
+| 1 | vanilla | 1 | exploring=False n_basins=1 | switch_to_metad → contacts |
+| 2–4 | metad | 5 | recross 1, both states in R2, then since_high 1, 2 | extend |
+| 5–7 | metad | 11 | recross 2 → 3: the walker came back on its own | extend |
+| 8–9 | metad | 15 | since_high 2, 3; drift 14.7, 17.4; per-round max falling | extend |
+| 10 | metad | 17 | since_high 4, depth 53.2 rising, max 0.63 | **add_cv → ψ(Gly7)** |
+| 11–12 | metad, parallel | 20 | ψ swept −π…π in the first ns; Q 0.13–0.57; no return yet | extend → budget |
+
+*The judgment at round 10, in the scientist's words:* "The current CV correctly separated the states (recrossings=3) so it was not wrong — but it is insufficient to drive the walker back to the folded basin… The barrier gating re-folding likely runs along a turn geometry that the global contact fraction cannot resolve; adding backbone torsions of the CLN025 turn residues." It cited the declining per-round maxima across five rounds (0.77 → 0.54 → 0.43 → 0.52 → 0.63), chose `add_cv` over `switch_cv` on exactly the distinction `action_add_cv.md` draws, and proposed ψ of Gly7 — the β-turn — which is the coordinate a person would pick and which was deliberately not pre-selected. On disk: `PBMETAD ARG=native_contacts_fraction,psi_gly7`, RESTART, the 17 035 hills on contacts kept and read back, the torsion's file started fresh with SIGMA 0.18 rad measured from the trajectory, and COLVAR's clock restarting at 18 200 ps — the walker carried over, where v1 had restarted from the folded cache.
+
+*What the budget allowed.* The escalation came at round 10 of 12 because the absence signal needs three to four rounds to accumulate, so the parallel bias had 3 ns. The torsion moved through its full range at once — the added bias is active — but the hairpin did not re-form in those 3 ns. Surface on the observable, scored on its own cumulative `sum_hills` marginal (the scorer now prefers that when the biased coordinate *is* the observable, since the reweighted surface only sees the COLVAR written since the addition): ΔG(unfolded − folded) −16.5 kJ/mol against the 75 ns reference's −35.8, rms 24 kJ/mol — the right sign where v1's contacts phase had +6.2 and its post-switch surface +44.5, and not a match. **Verdict: INCOMPLETE (reference unconverged)**, as before, and honestly so.
+
+*v1 against v2, same seed, same budget.* v1: coordinate replaced at round 6, walker reset to the folded cache, eight of eleven remaining nanoseconds spent re-unfolding, final surface wrong-signed. v2: coordinate kept and a turn torsion added at round 10, walker carried over, no nanosecond spent re-doing what had been done, final surface right-signed and three times closer to the reference. The loop's mechanics no longer waste the budget; what remains is that 20 ns is short for this transition in this force field, and the trap signal's three-round latency spends a third of it before the scientist can act. Both are task-file and threshold questions now, not loop questions.
+
 **What the case established.** Beats one and two are real: the scientist read the gate, pivoted, watched a coordinate fail to bring the system back, tracked the count across three rounds in its own ledger, and replaced the coordinate on computed evidence with every number it cited verified against its report. That loop — notice the mistake, name the evidence, change the plan — is what MDPilot exists for, and it ran unattended. Beat three did not close, and the record says exactly why. Two follow-ups fall out, recorded here rather than built: a `switch_cv` should warm-start from the walker's last positions carried as a State; and a campaign whose reference cannot converge is a campaign whose task file promised more than the method can deliver — which is a pre-flight question, not a scientist question.
 
 ### 2026-09-03 — `test` merged to `main`; CI's first real catch; F14 lands

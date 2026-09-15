@@ -192,3 +192,26 @@ def test_an_unconverged_reference_is_compared_but_cannot_be_matched(tmp_path: Pa
     assert v["reference"]["rms_kj_per_mol"] < 1e-6          # compared all the same
     assert not v["reference"]["matches"] and not v["passed"]
     assert v["verdict"] == "INCOMPLETE (reference unconverged)"
+
+
+def test_the_observables_own_marginal_is_preferred_when_it_is_biased(tmp_path: Path) -> None:
+    """After an `add_cv` the COLVAR restarts, so the reweighted surface sees
+    only the rounds since; the `sum_hills` marginal on the observable's own
+    hills is cumulative across the addition and is the surface to score."""
+    task = load_task_file(Path("benchmarks/tasks/cln025_contacts.yaml"))
+    work = _campaign(tmp_path, surface_path=write_fes(_hairpin_surface(-30.0), tmp_path / "rw.dat"))
+    marginal = write_fes(_hairpin_surface(4.0), tmp_path / "fes.dat")
+    import sqlite3
+    with sqlite3.connect(work / "state.db") as conn:      # the biased CV is the observable
+        conn.execute(
+            "UPDATE rounds SET report_json = replace(report_json, '\"cv_label\": \"nc\"', "
+            f"'\"cv_label\": \"{task.observable_name}\", \"fes_path\": \"{marginal}\"') "
+            "WHERE round_index = 2"
+        )
+    (work / "rounds").mkdir(exist_ok=True)
+    np.save(work / "rounds" / "round_002.obs.npy", np.array([0.05, 0.5, 0.95]))
+
+    v = e2e.verdict(work, task, reference_path=tmp_path / "absent.dat")
+
+    dg = v["observable_surface"]["delta_g_low_minus_high_kj_per_mol"]
+    assert dg is not None and dg > 0          # the marginal (+4), not the reweighted (-30)
