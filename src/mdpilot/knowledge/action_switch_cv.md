@@ -2,41 +2,32 @@
 
 `switch_cv` replaces the biased collective variable and starts a fresh bias on
 the new coordinate. The deposited hills on the old CV are kept as a record but
-are not carried over — they describe a different coordinate. The compute
-already spent is *not* refunded: the biased budget is cumulative across CVs,
-so a switch late in a campaign buys little. Use it when the evidence says the
-coordinate is wrong, not when the surface is merely still filling:
+are not carried over — they describe a different coordinate. The walker itself
+carries over: the new bias starts from where the system is now, not from the
+cached start. The compute already spent is *not* refunded: the biased budget
+is cumulative across CVs, so a switch late in a campaign buys little. Use it
+when the evidence says the coordinate is *wrong*, not when the surface is
+merely still filling:
 
-- the boundaries `recrossings` was counted between sit on the same side of the
-states your task describes (see the rule below), so the count is not measuring
-the transition you were asked for;
+- `occupancy_invariance` is `refuted` and its `inputs` show the walker never
+separated the states on this coordinate: `recrossings` stayed at 0 or the
+count was taken between boundaries that sit on the same side of the task's
+states, while `fes_depth_kj_per_mol` kept rising. The bias is filling a basin
+it cannot escape along this coordinate, and nothing deposited on it is worth
+keeping.
+- `state_definition_invariance` is `refuted`: the states are not separated by
+a barrier on the campaign observable, so no bias on this coordinate can
+produce a ΔG that means what the task asks.
 - the walker left the region it started in — compare `cv_start` against
-`cv_min`/`cv_max` — and many rounds have passed without it returning;
-- `recrossings` has stayed at 0 across several rounds while
-`fes_depth_kj_per_mol` keeps growing, which is a bias filling a basin it
-cannot escape along this coordinate;
-- **the walker is trapped**: `rounds_confined` is 2 or more, meaning this
-round's observable range and the previous rounds' all sat entirely inside the
-single state named by `confined_to_state`, while `fes_depth_kj_per_mol` kept
-rising. This is the clearest trap signal you have, and it is the one the
-cumulative `cv_min`/`cv_max` cannot show you — those keep reporting the widest
-excursion the campaign ever made. A bounded coordinate does not protect you
-here: a contact count collapses every disordered conformation onto roughly the
-same value, so once the system is disordered the bias fills one degenerate bin
-and cannot lead it back. Prefer a replacement that separates the states on the
-side you are stuck in — an `rmsd` with an upper wall, or a `gyration`, both of
-which still distinguish disordered structures a contact count cannot.
+`cv_min`/`cv_max` — and `ns_since_*_visited` for the starting state has grown
+past the tolerance with no sign of return.
 
-- **the walker is not coming back**: `ns_since_high_visited` (or `_low_`)
-is 8 ns or more on the state the walker started from, while
-`fes_depth_kj_per_mol` keeps rising. Judge it in nanoseconds, not rounds —
-rounds are whatever length the schedule makes them. A real campaign unfolded in its second
-biased round and then spent three rounds at Q between 0.03 and 0.55 — below
-the folded threshold every frame, above the unfolded one often enough that
-`rounds_confined` never fired — while the surface deepened past 30 kJ/mol.
-The per-round range looked like exploration; it was a coordinate that could
-not lead the system back. The bias on this coordinate has been given several
-rounds to return the walker and has not; more of it will not.
+Judge absence in nanoseconds, not rounds — rounds are whatever length the
+schedule makes them, and `occupancy_invariance.tolerance` is in ns. A
+bounded coordinate does not protect you: a contact count collapses every
+disordered conformation onto roughly the same value, so once the system is
+disordered the bias fills one degenerate bin and cannot lead it back. Prefer
+a replacement that separates the states on the side you are stuck in.
 
 `cv_switches_remaining` says how many revisions the campaign has left. When it
 reaches 0 the action disappears from your tool; spend one on a coordinate you

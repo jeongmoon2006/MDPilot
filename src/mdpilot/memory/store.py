@@ -79,6 +79,9 @@ _LEGACY_CONFIG_DEFAULTS: dict[str, Any] = {
     "state_thresholds": None,
     # Before this, one crossing was enough to satisfy `fes_converged`.
     "min_recrossings": 1,
+    # Before this, the occupancy trap signal's tolerance was prompt prose
+    # naming 8 ns; the falsifier now reads it from the config.
+    "absence_tolerance_ns": 8.0,
     # Before these, the bias took `bias_designer`'s own defaults; None still
     # means exactly that, so absent and unset agree.
     "bias_pace": None,

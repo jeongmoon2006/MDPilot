@@ -35,6 +35,7 @@ import streamlit as st  # noqa: E402
 import yaml  # noqa: E402
 import streamlit.components.v1 as components  # noqa: E402
 
+from mdpilot.diagnostics.report import report_field
 from mdpilot.diagnostics import free_energy  # noqa: E402
 from mdpilot.memory import store  # noqa: E402
 from mdpilot.orchestrator.loop import run_campaign, steps_per_ns_for  # noqa: E402
@@ -127,13 +128,25 @@ def format_event(name: str, payload: dict[str, Any]) -> list[str]:
 _VANILLA_KEYS = ("trajectory_length_ns", "mean", "ess", "plateau_reached", "exploring", "n_basins")
 _METAD_KEYS = (
     "cv_label", "fes_drift_kj_per_mol", "recrossings", "min_recrossings",
-    "barrier_kj_per_mol", "fes_depth_kj_per_mol", "fes_converged", "recrossing_basis",
+    "barrier_kj_per_mol", "fes_depth_kj_per_mol", "recrossing_basis",
 )
 
 
 def _report_lines(report: dict[str, Any]) -> list[str]:
     keys = _METAD_KEYS if report.get("phase") == "metad" else _VANILLA_KEYS
-    shown = [f"{k}={report[k]!r}" for k in keys if report.get(k) is not None]
+    shown = [
+        f"{k}={report_field(report, k)!r}" for k in keys
+        if report_field(report, k) is not None
+    ]
+    gate = report_field(report, "gate")
+    if gate is not None:
+        shown.append(f"precision.gate={gate!r}")
+    summary = (report.get("correctness") or {}).get("summary") or {}
+    if summary:
+        shown.append(
+            f"falsifiers: refuted={summary.get('refuted')} "
+            f"not_evaluable={summary.get('not_evaluable')}"
+        )
     return _wrap("  ".join(shown), 96) or ["(no diagnostics)"]
 
 

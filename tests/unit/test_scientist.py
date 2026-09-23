@@ -196,8 +196,12 @@ def test_decide_rejects_switch_without_proposal() -> None:
             "metad_proposal": None,
         }
     )
-    with pytest.raises(RuntimeError, match="metad_proposal is null"):
-        decide({}, client=fake)
+    # Retried, then refused: the contract violation goes back to the model as
+    # a tool error rather than ending the round on a bare RuntimeError.
+    from mdpilot.orchestrator.scientist import MalformedDecision
+
+    with pytest.raises(MalformedDecision, match="metad_proposal is null"):
+        decide({}, client=_SequenceClient([fake._tool_input] * 3), task_expectation="t")
 
 
 def test_decide_rejects_proposal_with_non_switch_decision() -> None:
@@ -214,8 +218,10 @@ def test_decide_rejects_proposal_with_non_switch_decision() -> None:
             },
         }
     )
-    with pytest.raises(RuntimeError, match="must be null"):
-        decide({}, client=fake)
+    from mdpilot.orchestrator.scientist import MalformedDecision
+
+    with pytest.raises(MalformedDecision, match="must be null unless"):
+        decide({}, client=_SequenceClient([fake._tool_input] * 3))
 
 
 def test_decision_tool_schema_includes_metad_proposal() -> None:
@@ -810,10 +816,13 @@ def test_add_cv_is_offered_with_switch_cv_and_carries_a_proposal() -> None:
     result = decide({"stub": True}, phase="metad", allow_cv_switch=True, client=fake)
     assert result.decision == "add_cv" and result.metad_proposal.label == "psi_turn"
 
-    with pytest.raises(RuntimeError, match="metad_proposal is null"):
-        decide({"stub": True}, phase="metad", allow_cv_switch=True, client=_SequenceClient([
-            {"decision": "add_cv", "reason": "r", "extra_ns": None, "ledger_note": None,
-             "metad_proposal": None}]))
+    from mdpilot.orchestrator.scientist import MalformedDecision
+
+    bad = {"decision": "add_cv", "reason": "r", "extra_ns": None, "ledger_note": None,
+           "metad_proposal": None}
+    with pytest.raises(MalformedDecision, match="metad_proposal is null"):
+        decide({"stub": True}, phase="metad", allow_cv_switch=True,
+               client=_SequenceClient([bad, bad, bad]))
 
 
 def test_the_add_cv_guidance_travels_with_the_switch_guidance() -> None:
@@ -825,3 +834,48 @@ def test_the_add_cv_guidance_travels_with_the_switch_guidance() -> None:
     fake = _stub()
     decide({"stub": True}, phase="metad", allow_cv_switch=False, client=fake)
     assert "Action `add_cv`" not in _system_text(fake)
+
+
+# ---------- a tool call that breaks the contract is retried, not fatal ----------
+
+class _ReplayClient:
+    """Replays one tool_use payload per call, in order."""
+
+    def __init__(self, *payloads: dict[str, Any]) -> None:
+        self._queue = list(payloads)
+        self.requests: list[dict[str, Any]] = []
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        block = SimpleNamespace(
+            type="tool_use", name="record_decision", id=f"toolu_{len(self.requests)}",
+            input=self._queue.pop(0),
+        )
+        return SimpleNamespace(content=[block], stop_reason="tool_use")
+
+
+def test_a_switch_with_no_proposal_is_sent_back_and_retried() -> None:
+    """Seen live in the ablation replay: `switch_cv` with `metad_proposal: null`
+    was a bare RuntimeError out of the parser, which ended the run. It is the
+    same shape as a misquote and is handled the same way."""
+    from mdpilot.orchestrator.scientist import MalformedDecision
+
+    bad = {"decision": "switch_cv", "reason": "trapped", "extra_ns": None,
+           "ledger_note": None, "cited": [], "metad_proposal": None}
+    good = {"decision": "extend", "reason": "more", "extra_ns": 1.0,
+            "ledger_note": None, "cited": [], "metad_proposal": None}
+    client = _ReplayClient(bad, good)
+
+    result = decide({"recrossings": 1}, phase="metad", allow_cv_switch=True,
+                    task_expectation="t", client=client)
+
+    assert result.decision == "extend"
+    followup = client.requests[1]["messages"][-1]["content"][0]
+    assert followup["type"] == "tool_result" and followup["is_error"]
+    assert "metad_proposal is null" in followup["content"]
+
+    with pytest.raises(MalformedDecision) as info:
+        decide({"recrossings": 1}, phase="metad", allow_cv_switch=True,
+               task_expectation="t", client=_ReplayClient(bad, bad, bad))
+    assert info.value.decision.decision == "switch_cv" and info.value.attempts == 3

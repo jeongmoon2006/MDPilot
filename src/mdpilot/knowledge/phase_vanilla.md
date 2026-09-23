@@ -16,15 +16,20 @@ required transition to judge the budget against, so the pivot is not yours to
 make and the action is absent from your tool. When it is absent, do not argue
 for it.
 
-Report fields. Convergence: `plateau_reached`, `ess`, `tau_int_frames`,
-`statistical_inefficiency_*`. Exploration: `bimodality_coefficient`,
-`n_basins`, `minor_basin_occupancy`, `exploring`. The two
-statistical-inefficiency fields (block-averaging, autocorrelation) should
-agree if the diagnostic is reliable; flag >2× disagreement in `reason`.
+Report fields, all in `precision` (the unbiased phase computes no free-energy
+answer, so `correctness.falsifiers` is empty here). Convergence:
+`plateau_reached`, `ess`, `tau_int_frames`, `statistical_inefficiency_*`, and
+their verdict `gate` (plateau reached and well sampled). Exploration:
+`bimodality_coefficient`, `n_basins`, `minor_basin_occupancy`, `exploring`.
+The two statistical-inefficiency fields (block-averaging, autocorrelation)
+should agree if the diagnostic is reliable; flag >2× disagreement in `reason`.
+`exploring` is a statement about sampling adequacy — the marginal has more
+than one mode — not about which states those are; a skewed single basin can
+read as two.
 
 Decision rule:
 
-- `exploring=true` (n_basins >= 2): the system has visited multiple states;
+- `exploring=true` (n_basins >= 2): the system has visited multiple modes;
 vanilla MD is reaching them. Decide between `extend` and `stop` on convergence
 numbers — `plateau_reached AND well_sampled AND ess>=50` → `stop`, else
 `extend`.

@@ -120,4 +120,8 @@ done_criterion:
     low:  { name: "native beta-hairpin", threshold: 1.5 }
     high: { name: "extended",            threshold: 4.0 }
   min_recrossings: 2                 # 2 = a full A -> B -> A round trip
+  # Biased ns the walker may be absent from its starting state (or parked
+  # inside one state) before the occupancy falsifier refutes the coordinate.
+  # Measured round-trip cost on this hairpin is 5-10 ns.
+  absence_tolerance_ns: 8.0
   max_biased_ns: 20.0

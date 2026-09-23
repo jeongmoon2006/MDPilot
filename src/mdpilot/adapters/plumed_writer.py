@@ -403,7 +403,10 @@ class UpperWall:
     at: float                 # CV units (nm for length-dimensioned CVs)
     kappa: float              # kJ/mol per CV-unit^exp
     exp: int = 2
-    wall_label: str = "uwall"
+    # Derived from the CV by default: two walled coordinates in one input
+    # (an `add_cv` beside a walled length CV) rendered two actions labelled
+    # `uwall`, and PLUMED aborts at init on a reused label.
+    wall_label: str | None = None
     # The CV value at which the solute would reach the edge of its box,
     # measured from the source trajectory by `bias_designer.box_limited_wall`.
     # None when it could not be derived.
@@ -423,9 +426,20 @@ class UpperWall:
         if self.exp < 1:
             raise ValueError(f"UpperWall: exp must be >= 1 (got {self.exp})")
 
+    @property
+    def label(self) -> str:
+        return self.wall_label or f"uwall_{self.cv_label}"
+
+    @property
+    def bias_value(self) -> str:
+        """The wall's own bias column. Printed to COLVAR so the reweighting can
+        account for it: frames the wall was acting on are otherwise reweighted
+        as if the wall were physics."""
+        return f"{self.label}.bias"
+
     def render(self) -> str:
         return (
-            f"{self.wall_label}: UPPER_WALLS ARG={self.cv_label} "
+            f"{self.label}: UPPER_WALLS ARG={self.cv_label} "
             f"AT={self.at:g} KAPPA={self.kappa:g} EXP={self.exp}"
         )
 
@@ -501,6 +515,13 @@ class PlumedInput:
         cv_labels = {cv.label for cv in self.cvs}
         if len(cv_labels) != len(self.cvs):
             raise ValueError("PlumedInput: CV labels must be unique")
+        # Every action label, not only the CVs: PLUMED refuses a reused label
+        # at init, after the MD engine has already been built.
+        actions = [cv.label for cv in self.cvs] + [w.label for w in self.walls]
+        actions.append(self.bias.bias_value.split(".")[0])
+        if len(set(actions)) != len(actions):
+            dupes = sorted({a for a in actions if actions.count(a) > 1})
+            raise ValueError(f"PlumedInput: action label(s) reused: {dupes}")
         used = self._bias_cv_labels() | {w.cv_label for w in self.walls}
         missing = used - cv_labels
         if missing:
@@ -578,7 +599,11 @@ class PlumedInput:
                     ]
                 lines.append(wall.render())
         lines += ["", "# Periodic output"]
-        print_args = ",".join([cv.label for cv in self.cvs] + [self.bias.bias_value])
+        print_args = ",".join(
+            [cv.label for cv in self.cvs]
+            + [self.bias.bias_value]
+            + [w.bias_value for w in self.walls]
+        )
         colvar = Path(self.output_dir) / self.colvar_file
         lines.append(
             f"PRINT ARG={print_args} STRIDE={self.print_stride} FILE={colvar}"

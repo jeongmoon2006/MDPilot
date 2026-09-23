@@ -49,6 +49,7 @@ def test_cln025_produces_the_kwargs_the_runner_hand_assembled() -> None:
         "cv_upper_wall_nm": 0.8,
         "min_recrossings": 2,
         "max_biased_ns": 20.0,
+        "absence_tolerance_ns": 8.0,
         "state_thresholds": (1.5, 4.0),
         # Prose, carried only for the pre-flight structure check.
         "description": task.campaign["description"],

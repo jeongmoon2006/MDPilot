@@ -34,6 +34,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -50,14 +51,16 @@ from mdpilot.adapters.plumed_writer import (
     enable_restart,
 )
 from mdpilot.adapters.system_spec import SystemSpec
+from mdpilot.diagnostics import falsifiers as fz
 from mdpilot.diagnostics.free_energy import (
     delta_g_kj_per_mol,
     load_colvar,
+    load_fes,
     metad_report,
     reweighted_profile,
     write_fes,
 )
-from mdpilot.diagnostics.report import make_report
+from mdpilot.diagnostics.report import group_report, make_report, report_field
 from mdpilot import preflight
 from mdpilot.observables import (
     COLVAR_OBSERVABLE_LABEL,
@@ -70,6 +73,7 @@ from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import (
     Decision,
     DecisionRefused,
+    MalformedDecision,
     MetadProposal,
     UnresolvableProposal,
     decide,
@@ -159,6 +163,7 @@ def run_campaign(
     max_biased_ns: float | None = None,
     min_recrossings: int = 1,
     state_thresholds: tuple[float, float] | None = None,
+    absence_tolerance_ns: float = 8.0,
     max_cv_switches: int = 2,
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
@@ -171,6 +176,7 @@ def run_campaign(
     equilibration_steps: int = 0,
     task_expectation: str | None = None,
     biased_adapter_factory: BiasedAdapterFactory | None = None,
+    decide_fn: Callable[..., Decision] | None = None,
 ) -> CampaignResult:
     """Run the closed loop, resuming from `work_dir/state.db` if it exists.
 
@@ -188,6 +194,12 @@ def run_campaign(
     against it means something different every round (F7, F9). A fixed band on
     the coordinate the task defines its states on is comparable across rounds
     and across a change of biased CV.
+
+    `absence_tolerance_ns` is the occupancy falsifier's tolerance: biased
+    nanoseconds the walker may be absent from the state it started in, or
+    parked inside one state, before the coordinate is refuted
+    (`diagnostics.falsifiers`, docs/falsifiers.md). A tolerance the task file
+    owns, locked with the rest because it gates stop permission.
 
     `max_cv_switches` is how many times the scientist may revise the biased
     coordinates within one campaign — by replacing the set (`switch_cv`) or by
@@ -257,6 +269,11 @@ def run_campaign(
     pivot from a rendered plumed.dat string. Defaults to an `OpenMMAdapter`
     over the same `SystemSpec` with `plumed_input` set. Inject to run the
     biased phase through a different engine (or a fake, in tests).
+
+    `decide_fn` replaces the scientist for this run. The fault-injection
+    suite (`mdpilot.faults`) drives deliberately broken campaigns with a
+    scripted policy so that every verifier arm later judges a trajectory no
+    verifier shaped. Left at None the LLM decides, as always.
     """
     # A biased phase without task states would fall back to counting
     # recrossings between the two deepest basins of the current surface, which
@@ -351,6 +368,10 @@ def run_campaign(
         # one changes when the campaign is allowed to end, retroactively, for
         # rounds already judged under the old value.
         "min_recrossings": min_recrossings,
+        # The occupancy falsifier's tolerance. It decides when a coordinate is
+        # refuted, which decides whether a stop is honoured; a resume under a
+        # different one re-judges rounds already decided.
+        "absence_tolerance_ns": float(absence_tolerance_ns),
     }
     # Bias shape is biased-phase physics: resuming under a different gamma or
     # deposition stride would join two differently-filled surfaces into one
@@ -590,12 +611,13 @@ def run_campaign(
             max_cv_switches=max_cv_switches,
             active_cvs=active_cvs,
             frame_ps=report_interval_steps * adapter.timestep_fs / 1000.0,
+            absence_tolerance_ns=absence_tolerance_ns,
         )
         _emit(on_event, "report", round_index=round_idx, report=report)
         prior_summaries = [_compact_prior(r) for r in rounds]
         override_note: str | None = None
         try:
-            decision = decide(
+            decision = (decide_fn or decide)(
                 report,
                 prior_round_summaries=prior_summaries,
                 hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
@@ -918,8 +940,17 @@ def _round_report(
     max_cv_switches: int = 0,
     active_cvs: list[MetadProposal] | None = None,
     frame_ps: float | None = None,
+    absence_tolerance_ns: float = 8.0,
 ) -> dict[str, Any]:
-    """Diagnostic bundle for one round, chosen by phase.
+    """Diagnostic bundle for one round, chosen by phase, in three blocks.
+
+    `validity` / `precision` / `correctness` (docs/falsifiers.md §1). The
+    numbers are the same flat bundles `make_report` and `metad_report` have
+    always produced, regrouped by the kind of claim each supports; the
+    correctness block carries the answer (ΔG on the campaign observable) and
+    the fixed falsifier set that tried to refute it. Nothing in this report
+    says a result is correct; the strongest thing it can say is
+    `correctness.summary.not_refuted`.
 
     With several coordinates biased in parallel the scientist still judges
     one *primary* surface: the campaign observable's own marginal when the
@@ -947,9 +978,13 @@ def _round_report(
     well-tempered convergence test wants — not per-round.
     """
     if plumed_dat_path is None:
-        report = make_report(trajectory_path, topology_path, observable)
-        report["phase"] = "vanilla"
-        return report
+        # The unbiased phase has no free-energy answer to falsify; its
+        # correctness block is empty and its precision gate is the equilibrium
+        # rubric.
+        return group_report(
+            make_report(trajectory_path, topology_path, observable),
+            phase="vanilla", falsifiers={},
+        )
 
     # Only computed when there are task states to count against: it costs a
     # trajectory load, and without thresholds nothing consumes the result.
@@ -975,58 +1010,79 @@ def _round_report(
         observable_name=observable_name,
         state_thresholds=state_thresholds,
     )
+    # --- the occupancy falsifier's inputs: where the walker was *this round*
+    # and how long it has been away. COLVAR appends across the whole biased
+    # phase, so `cv_min`/`cv_max` keep reporting the widest excursion the
+    # campaign ever made long after the walker has stopped moving; the
+    # per-round view is what shows a trap (F13), and the absence in ns is what
+    # shows a walker roaming without returning (F15). Rounds are whatever
+    # length the schedule makes them, so the tolerance is in time.
+    occupancy_inputs: dict[str, Any] = {}
+    ns_since_low = ns_since_high = ns_confined = None
+    confined: str | None = None
+    start_state: str | None = None
     if this_round is not None and this_round.size:
-        # Where the walker was *this round*, not cumulatively. COLVAR appends
-        # across the whole biased phase, so `cv_min`/`cv_max` keep reporting the
-        # widest excursion the campaign ever made — which reads as "the full
-        # range is being explored" long after the walker has stopped moving.
-        # A campaign sat at 0.03-0.13 for two rounds while the scientist
-        # correctly quoted a cumulative 0.39-10.01 and concluded the opposite.
-        report["observable_min_this_round"] = float(this_round.min())
-        report["observable_max_this_round"] = float(this_round.max())
-        # Trapped-walker detection, computed rather than left to be inferred.
-        # A campaign sat between 0.03 and 0.13 of its native contacts for two
-        # rounds while the deposited bias grew past 115 kJ/mol and the
-        # scientist, reading only cumulative ranges, concluded the full
-        # coordinate was being explored.
-        confined, rounds_confined = _confinement(
+        occupancy_inputs["observable_min_this_round"] = float(this_round.min())
+        occupancy_inputs["observable_max_this_round"] = float(this_round.max())
+        confined, rounds_confined, frames_confined = _confinement(
             rounds_dir, round_index, state_thresholds
         )
-        report["confined_to_state"] = confined
-        report["rounds_confined"] = rounds_confined
-        # The other face of the trap. `rounds_confined` fires when a round sits
-        # entirely inside one state; a walker that roams the disordered region
-        # without ever re-entering the state it started from never trips it.
-        # A real campaign sat at Q in [0.03, 0.55] for three rounds — below the
-        # folded threshold of 0.7 every frame, straddling the unfolded one at
-        # 0.3 — and reported `rounds_confined=0` throughout while the scientist
-        # wrote "did not reach the folded state" three times and extended.
         absence = _absence(rounds_dir, round_index, state_thresholds)
-        report["rounds_since_low_visited"] = absence["low"][0]
-        report["rounds_since_high_visited"] = absence["high"][0]
-        # The same absence in nanoseconds. Rounds are whatever length the
-        # schedule makes them — three rounds of 2 ns and three of 5 ns are not
-        # the same wait — so the scientist's trigger is stated in time, and a
-        # longer extension schedule does not push the revision later.
-        if frame_ps is not None:
-            report["ns_since_low_visited"] = absence["low"][1] * frame_ps / 1000.0
-            report["ns_since_high_visited"] = absence["high"][1] * frame_ps / 1000.0
-    colvar_path = bias_dir / _COLVAR_NAME
-    if state_thresholds is not None and colvar_path.exists():
-        profile = observable_surface_from_colvar(
-            colvar_path, topology_path, observable, temperature_k
+        occupancy_inputs.update(
+            confined_to_state=confined,
+            rounds_confined=rounds_confined,
+            rounds_since_low_visited=absence["low"][0],
+            rounds_since_high_visited=absence["high"][0],
         )
-        if profile is not None:
-            report["observable_fes_path"] = str(
-                write_fes(profile, fes_dir / "observable_fes.dat")
+        if frame_ps is not None:
+            ns_since_low = absence["low"][1] * frame_ps / 1000.0
+            ns_since_high = absence["high"][1] * frame_ps / 1000.0
+            ns_confined = frames_confined * frame_ps / 1000.0
+            occupancy_inputs.update(
+                ns_since_low_visited=ns_since_low,
+                ns_since_high_visited=ns_since_high,
+                ns_confined=ns_confined,
             )
+        if series is not None and series.size and state_thresholds is not None:
             low, high = float(state_thresholds[0]), float(state_thresholds[1])
-            report["delta_g_low_minus_high_kj_per_mol"] = delta_g_kj_per_mol(
-                profile, low, high, temperature_k
-            )
+            first = float(series[0])
+            start_state = "high" if first >= high else "low" if first <= low else None
+            occupancy_inputs["start_state"] = start_state
+
+    # --- the answer, on the campaign observable, reweighted from COLVAR with
+    # every bias column (metadynamics *and* walls) accounted for.
+    colvar_path = bias_dir / _COLVAR_NAME
+    columns = None
+    if colvar_path.exists() and (state_thresholds is not None or len(active) > 1):
+        # Only read when something consumes it: the answer needs states, and
+        # `cv_ranges` needs several coordinates. A file PLUMED has created but
+        # not yet flushed a row into parses as nothing, which is not an error
+        # here — the falsifiers report `not_evaluable` on an empty series.
+        try:
+            columns = load_colvar(colvar_path)
+        except ValueError:
+            columns = None
+    obs_column = total_bias = wall_bias = profile = None
+    if columns is not None:
+        obs_column, total_bias, wall_bias = _colvar_observable_and_bias(
+            columns, topology_path, observable
+        )
+    answer: dict[str, Any] = {}
+    if state_thresholds is not None and obs_column is not None:
+        low, high = float(state_thresholds[0]), float(state_thresholds[1])
+        spec = observable or ObservableSpec.ca_rmsd_angstrom()
+        profile = reweighted_profile(obs_column, total_bias, temperature_k, label=spec.name)
+        report["observable_fes_path"] = str(
+            write_fes(profile, fes_dir / "observable_fes.dat")
+        )
+        answer["delta_g_low_minus_high_kj_per_mol"] = delta_g_kj_per_mol(
+            profile, low, high, temperature_k
+        )
+        answer["observable"] = spec.name
+        answer["states"] = {"low": low, "high": high}
+
     report["biased_cvs"] = [p.label for p in active]
-    if len(active) > 1 and colvar_path.exists():
-        columns = load_colvar(colvar_path)
+    if len(active) > 1 and columns is not None:
         report["cv_ranges"] = {
             p.label: [float(columns[p.label].min()), float(columns[p.label].max())]
             for p in active if p.label in columns
@@ -1035,10 +1091,90 @@ def _round_report(
     # what is left rather than only discovering the action is gone.
     report["cv_switches_used"] = cv_switches_used
     report["cv_switches_remaining"] = max(max_cv_switches - cv_switches_used, 0)
-    report["phase"] = "metad"
     report["trajectory_path"] = str(trajectory_path)
     report["plumed_dat_path"] = str(plumed_dat_path)
-    return report
+
+    # --- the falsifiers: the fixed set, every round, never selected.
+    if state_thresholds is None:
+        falsifiers = fz.not_applicable_set(
+            "the campaign declares no states, so there is no ΔG to falsify"
+        )
+    else:
+        low, high = float(state_thresholds[0]), float(state_thresholds[1])
+        spec = observable or ObservableSpec.ca_rmsd_angstrom()
+        # The observable's own hills marginal, when it is the primary biased
+        # coordinate — the second estimator (b-i) compares against.
+        hills_surface = None
+        if report.get("cv_label") == spec.name and report.get("fes_path"):
+            hills_surface = load_fes(Path(report["fes_path"])).restricted_to(
+                float(report["cv_min"]), float(report["cv_max"])
+            )
+        falsifiers = {
+            "seed_invariance": fz.seed_invariance(
+                answer.get("delta_g_low_minus_high_kj_per_mol"), None,
+                temperature_k, n_walkers=1,
+            ),
+            "estimator_invariance": fz.estimator_invariance(
+                hills_surface, profile, low, high, temperature_k
+            ),
+            "time_window_invariance": (
+                fz.time_window_invariance(obs_column, total_bias, low, high, temperature_k)
+                if obs_column is not None
+                else fz.time_window_invariance(np.empty(0), np.empty(0), low, high, temperature_k)
+            ),
+            "occupancy_invariance": fz.occupancy_invariance(
+                start_state=start_state,
+                ns_since_low=ns_since_low, ns_since_high=ns_since_high,
+                ns_confined=ns_confined, confined_to_state=confined,
+                tolerance_ns=absence_tolerance_ns, inputs=occupancy_inputs,
+            ),
+            "state_definition_invariance": fz.state_definition_invariance(
+                profile, low, high, temperature_k
+            ),
+            "bias_accounting_invariance": (
+                fz.bias_accounting_invariance(
+                    obs_column, total_bias, wall_bias, low, high, temperature_k
+                )
+                if obs_column is not None
+                else fz.bias_accounting_invariance(
+                    np.empty(0), np.empty(0), wall_bias, low, high, temperature_k
+                )
+            ),
+        }
+    return group_report(report, phase="metad", falsifiers=falsifiers, answer=answer)
+
+
+def _colvar_observable_and_bias(
+    columns: dict[str, np.ndarray],
+    topology_path: Path,
+    observable: ObservableSpec | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """The observable column in its own units, the total bias, and the walls'
+    share of it — or Nones when COLVAR predates the printed observable.
+
+    Every `.bias` column is summed: the well-tempered bias and any wall. The
+    reweighting used to take the *first* `.bias` column, which was the
+    metadynamics one, so frames the wall was pushing on were reweighted as if
+    the wall were physics. The walls' own sum is returned separately so the
+    bias-accounting falsifier can test with and without them.
+    """
+    if COLVAR_OBSERVABLE_LABEL not in columns:
+        return None, None, None
+    bias_columns = [k for k in columns if k.endswith(".bias")]
+    if not bias_columns:
+        return None, None, None
+    wall_columns = [k for k in bias_columns if k.startswith("uwall")]
+    total = np.sum([columns[k] for k in bias_columns], axis=0)
+    wall = np.sum([columns[k] for k in wall_columns], axis=0) if wall_columns else None
+    spec = observable or ObservableSpec.ca_rmsd_angstrom()
+    reference = md.load(str(topology_path))
+    with tempfile.TemporaryDirectory() as scratch:
+        cv = design_cv(
+            observable_cv_proposal(spec), reference.topology,
+            reference=reference, output_dir=Path(scratch),
+        )
+    series = columns[COLVAR_OBSERVABLE_LABEL] * colvar_to_observable_factor(spec, cv)
+    return series, total, wall
 
 
 def _primary_hills(active: list[MetadProposal], observable: ObservableSpec | None) -> str:
@@ -1056,22 +1192,24 @@ def _confinement(
     rounds_dir: Path | None,
     round_index: int | None,
     state_thresholds: tuple[float, float] | None,
-) -> tuple[str | None, int]:
-    """Which task state the walker has been stuck in, and for how many rounds.
+) -> tuple[str | None, int, int]:
+    """Which task state the walker has been stuck in, for how many rounds, and
+    how many frames those rounds hold.
 
     Walks backwards from this round and stops at the first one that was not
     confined, or was confined to the *other* state. Vanilla rounds write no
     observable file, so the count naturally stops at the pivot rather than
     running back into the unbiased phase.
 
-    `None, 0` means the walker moved between the bands this round, which is the
-    healthy case — a biased run is supposed to traverse them.
+    `None, 0, 0` means the walker moved between the bands this round, which is
+    the healthy case — a biased run is supposed to traverse them.
     """
     if rounds_dir is None or round_index is None or state_thresholds is None:
-        return None, 0
+        return None, 0, 0
     low, high = float(state_thresholds[0]), float(state_thresholds[1])
     state: str | None = None
     count = 0
+    frames = 0
     for index in range(round_index, 0, -1):
         path = rounds_dir / f"round_{index:03d}.obs.npy"
         if not path.exists():
@@ -1090,7 +1228,8 @@ def _confinement(
         elif here != state:
             break
         count += 1
-    return state, count
+        frames += int(series.size)
+    return state, count, frames
 
 
 def observable_surface_from_colvar(
@@ -1110,22 +1249,12 @@ def observable_surface_from_colvar(
     with it.
     """
     spec = observable or ObservableSpec.ca_rmsd_angstrom()
-    colvar = load_colvar(colvar_path)
-    bias_column = next((k for k in colvar if k.endswith(".bias")), None)
-    if COLVAR_OBSERVABLE_LABEL not in colvar or bias_column is None:
-        return None
-    reference = md.load(str(topology_path))
-    with tempfile.TemporaryDirectory() as scratch:
-        cv = design_cv(
-            observable_cv_proposal(spec), reference.topology,
-            reference=reference, output_dir=Path(scratch),
-        )
-    return reweighted_profile(
-        colvar[COLVAR_OBSERVABLE_LABEL] * colvar_to_observable_factor(spec, cv),
-        colvar[bias_column],
-        temperature_k,
-        label=spec.name,
+    series, total_bias, _wall = _colvar_observable_and_bias(
+        load_colvar(colvar_path), topology_path, observable
     )
+    if series is None:
+        return None
+    return reweighted_profile(series, total_bias, temperature_k, label=spec.name)
 
 
 def _absence(
@@ -1217,34 +1346,56 @@ def _accumulated_observable(
 def _refuse_premature_stop(
     decision: Decision, report: dict[str, Any], remaining_steps: int | None
 ) -> tuple[Decision, str | None]:
-    """Convert a biased-phase `stop` into an extend while the surface is unconverged.
+    """Convert a biased-phase `stop` into an extend unless the data allow it.
 
-    The system prompt already states the rule — `fes_converged=true` → stop,
-    otherwise extend — but a rule the model can reason its way around is not a
-    rule. On the first CLN025 campaign the scientist read `fes_converged=false`,
-    wrote a paragraph rationalising the constituent numbers, and stopped with 16
-    of 20 ns unspent and the done criterion one recrossing short.
+    Stop permission is `precision.gate` (the estimate has stopped moving and
+    the walker has crossed enough times) AND `correctness.summary.not_refuted`
+    (no falsifier refuted the answer and every applicable one could be
+    evaluated). Neither alone: a converged surface can be the wrong surface
+    (F13), and an unrefuted answer can still be moving. The prompt states the
+    same rule, but a rule the model can reason its way around is not a rule —
+    on the first CLN025 campaign the scientist read `fes_converged=false`,
+    wrote a paragraph rationalising the numbers, and stopped with 16 of 20 ns
+    unspent.
 
     This does not take judgement away from the scientist: it still chooses the
-    CV, sizes each extension, and decides when to stop once the diagnostic
-    actually reports convergence. It removes only the ability to declare victory
-    against the diagnostic. The refusal is written to the hypothesis ledger
-    rather than swallowed, so the next round sees that it happened.
+    CV, sizes each extension, and decides when to stop once the data permit
+    it. It removes only the ability to declare victory against the data. The
+    refusal is written to the hypothesis ledger rather than swallowed, so the
+    next round sees that it happened.
+
+    Reports persisted before the correctness block existed carry no summary;
+    for those the rule reduces to the precision gate, which is what it was.
     """
     if decision.decision != "stop":
         return decision, None
-    if report.get("fes_converged") is True:
+    gate = report_field(report, "gate")
+    if gate is None:
+        gate = report_field(report, "fes_converged")
+    summary = (report.get("correctness") or {}).get("summary") or {}
+    not_refuted = summary.get("not_refuted", True)
+    if gate is True and not_refuted:
         return decision, None
     if remaining_steps is not None and remaining_steps <= 0:
         return decision, None
 
+    blocked = []
+    if gate is not True:
+        blocked.append(
+            f"precision.gate={gate!r} "
+            f"(drift={report_field(report, 'fes_drift_kj_per_mol')}, "
+            f"recrossings={report_field(report, 'recrossings')}, "
+            f"required>={report_field(report, 'min_recrossings')})"
+        )
+    if not not_refuted:
+        blocked.append(
+            f"correctness: refuted={summary.get('refuted')}, "
+            f"not_evaluable={summary.get('not_evaluable')}"
+        )
     note = (
-        f"stop refused: the scientist chose stop but fes_converged="
-        f"{report.get('fes_converged')!r} "
-        f"(drift={report.get('fes_drift_kj_per_mol')}, "
-        f"recrossings={report.get('recrossings')}, "
-        f"required>={report.get('min_recrossings')}). Budget remains, so the "
-        f"round was converted to an extend. Reason given was: {decision.reason}"
+        f"stop refused: the scientist chose stop but {'; '.join(blocked)}. "
+        f"Budget remains, so the round was converted to an extend. Reason "
+        f"given was: {decision.reason}"
     )
     return replace(decision, decision="extend", extra_ns=decision.extra_ns or 0.5), note
 
@@ -1265,11 +1416,12 @@ def _refuse_decision(refused: DecisionRefused) -> tuple[Decision, str]:
     misread values and the ledger is what every later round remembers.
     """
     d = refused.decision
-    what = (
-        "a CV the campaign topology cannot resolve"
-        if isinstance(refused, UnresolvableProposal)
-        else "numbers that disagree with the report it was given"
-    )
+    if isinstance(refused, UnresolvableProposal):
+        what = "a CV the campaign topology cannot resolve"
+    elif isinstance(refused, MalformedDecision):
+        what = "a tool call that broke the decision contract"
+    else:
+        what = "numbers that disagree with the report it was given"
     note = (
         f"decision refused: the scientist chose {d.decision} citing {what}, "
         f"{refused.attempts} time(s) running ({refused.error}). Converted to an "
@@ -1634,6 +1786,7 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
     and `plateau_reached` forward from a biased round would re-introduce the
     equilibrium statistics the biased report deliberately omits.
     """
+    get = partial(report_field, r.report)
     base = {
         "round_index": r.index,
         "n_steps": r.n_steps,
@@ -1642,34 +1795,37 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
         "reason": r.decision.reason,
     }
     if r.plumed_dat_path is not None:
+        summary = (r.report.get("correctness") or {}).get("summary") or {}
         base.update(
             # Which coordinate this round was judged on. Across a switch_cv the
             # history holds counts from two different CVs, and a bare list of
             # recrossings would invite exactly the comparison F7 was about.
-            cv_label=r.report.get("cv_label"),
-            biased_cvs=r.report.get("biased_cvs"),
-            fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
-            recrossings=r.report.get("recrossings"),
+            cv_label=get("cv_label"),
+            biased_cvs=get("biased_cvs"),
+            fes_drift_kj_per_mol=get("fes_drift_kj_per_mol"),
+            recrossings=get("recrossings"),
             # Carried so the trend is visible: a range that shrinks round on
             # round is a walker settling into one state, whatever the
             # cumulative numbers say.
-            observable_min_this_round=r.report.get("observable_min_this_round"),
-            observable_max_this_round=r.report.get("observable_max_this_round"),
-            rounds_since_low_visited=r.report.get("rounds_since_low_visited"),
-            rounds_since_high_visited=r.report.get("rounds_since_high_visited"),
-            ns_since_low_visited=r.report.get("ns_since_low_visited"),
-            ns_since_high_visited=r.report.get("ns_since_high_visited"),
+            observable_min_this_round=get("observable_min_this_round"),
+            observable_max_this_round=get("observable_max_this_round"),
+            ns_since_low_visited=get("ns_since_low_visited"),
+            ns_since_high_visited=get("ns_since_high_visited"),
             # The boundaries move as the surface fills, so a count carried
             # forward without them is not comparable across rounds.
-            recrossing_low=r.report.get("recrossing_low"),
-            recrossing_high=r.report.get("recrossing_high"),
-            fes_converged=r.report.get("fes_converged"),
+            recrossing_low=get("recrossing_low"),
+            recrossing_high=get("recrossing_high"),
+            precision_gate=get("gate", get("fes_converged")),
+            delta_g_low_minus_high_kj_per_mol=get("delta_g_low_minus_high_kj_per_mol"),
+            falsifiers_refuted=summary.get("refuted"),
+            falsifiers_not_evaluable=summary.get("not_evaluable"),
+            not_refuted=summary.get("not_refuted"),
         )
     else:
         base.update(
-            trajectory_length_ns=r.report.get("trajectory_length_ns"),
-            ess=r.report.get("ess"),
-            plateau_reached=r.report.get("plateau_reached"),
+            trajectory_length_ns=get("trajectory_length_ns"),
+            ess=get("ess"),
+            plateau_reached=get("plateau_reached"),
         )
     return base
 

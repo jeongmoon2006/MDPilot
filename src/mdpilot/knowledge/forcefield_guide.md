@@ -6,8 +6,10 @@ combination has been checked to load and to be solvatable by the engine, and
 anything outside the list is not offered because it has not been.
 
 Default: `amber14/tip3p`. Choose it unless there is a stated reason not to. It
-is ff14SB with TIP3P water, the best-tested option here, and it is what every
-campaign in this repository has run on.
+is ff14SB with TIP3P water and the best-tested option here. Force fields
+disagree with each other and with experiment on small fast-folding systems;
+when the request cites a force field the literature favours for that system
+and it is in the list, take it and say why in the description.
 
 **Water model** is usually the more consequential half for a solvated
 biomolecule, because it sets the solvent's density, dielectric and viscosity:
@@ -45,8 +47,10 @@ it**: TIP4P/Ice (no such model ships with OpenMM, so ice-nucleation work needs
 a parameter file this project does not yet carry), OPC water (loads, but the
 solvation step cannot build it), and any small-molecule force field such as
 GAFF or OpenFF — so a protein-ligand system cannot be parameterised yet.
-Propose the closest listed combination and name the gap plainly rather than
-inventing a key.
+When the science *needs* one of these, do not propose the closest listed
+combination: set `cannot_run` to a plain statement of what is missing. A
+campaign built on a substitute answers a different question from the one
+asked, and nothing downstream records that it did.
 
 **Do not change the force field to change a result.** A different force field
 is a different system, not a different analysis of the same one. If a campaign

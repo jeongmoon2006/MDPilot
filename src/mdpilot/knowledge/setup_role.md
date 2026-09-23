@@ -67,3 +67,21 @@ in the description.
 and leave `padding_nm` at 1.5 unless the campaign will drive the system much
 further apart than it starts — padding is applied to the *starting* structure,
 so a folded protein that will be pulled open needs more of it.
+
+**`absence_tolerance_ns`** is the one tolerance the task file owns. It is how
+long, in biased nanoseconds, the walker may stay away from the state it
+started in — or sit parked inside one state — before the campaign concludes
+the biased coordinate cannot bring the system back. Size it as a few round
+trips of the transition on a working coordinate: ~8 ns for a mini-protein
+hairpin, tens of ns for a binding or unbinding event, and say in the
+description what it was sized from.
+
+**Say no when the tools cannot run it.** You may only propose what this
+toolset can build: the listed force-field pairs, protein systems from a PDB
+id or a local structure, the five CV types, one engine with a metadynamics
+path. A small molecule that needs its own parameters, a water model or ice
+model not in the list, a coordinate outside the vocabulary, a lipid or a
+crystal — for any of these set `cannot_run` to a plain statement of the
+missing capability. Do not propose the nearest thing that *can* be built:
+a campaign on a substitute system answers a different question, and the
+researcher will not find out from the results.

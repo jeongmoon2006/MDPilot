@@ -193,6 +193,27 @@ _TASK_FILE_TOOL: dict[str, Any] = {
                                "null. Only meaningful for length-dimensioned "
                                "coordinates.",
             },
+            "absence_tolerance_ns": {
+                "type": "number",
+                "description": "Biased nanoseconds the walker may stay away "
+                               "from the state it started in before the "
+                               "coordinate is judged unable to bring it back. "
+                               "A few round trips of the transition on a "
+                               "working coordinate; ~8 for a mini-protein "
+                               "hairpin, tens for a binding event.",
+            },
+            "cannot_run": {
+                "type": ["string", "null"],
+                "description": "Null when this toolset can run the campaign. "
+                               "Otherwise a plain statement of the capability "
+                               "the request needs and this toolset lacks — a "
+                               "force field or water model not in the list, a "
+                               "small molecule or non-protein system, a "
+                               "coordinate outside the CV vocabulary, an "
+                               "engine feature. When set, the proposal is "
+                               "refused and nothing is written; the other "
+                               "fields may be best-effort placeholders.",
+            },
         },
         "required": [
             "name", "description", "starting_pdb", "structure_path",
@@ -202,7 +223,7 @@ _TASK_FILE_TOOL: dict[str, Any] = {
             "observable_normalize",
             "objective", "characteristic_timescale_ns", "timescale_source",
             "low_state", "high_state", "min_recrossings", "max_biased_ns",
-            "cv_upper_wall_nm",
+            "cv_upper_wall_nm", "absence_tolerance_ns", "cannot_run",
         ],
         "additionalProperties": False,
     },
@@ -253,6 +274,7 @@ def to_document(proposal: dict[str, Any]) -> dict[str, Any]:
             },
             "min_recrossings": proposal["min_recrossings"],
             "max_biased_ns": proposal["max_biased_ns"],
+            "absence_tolerance_ns": proposal["absence_tolerance_ns"],
         },
     }
     if proposal.get("cv_upper_wall_nm") is not None:
@@ -262,6 +284,20 @@ def to_document(proposal: dict[str, Any]) -> dict[str, Any]:
 
 def to_yaml(proposal: dict[str, Any]) -> str:
     return yaml.safe_dump(to_document(proposal), sort_keys=False, width=88)
+
+
+class SetupRefused(RuntimeError):
+    """The request needs a capability this toolset does not have.
+
+    Raised instead of writing a task file. The agent is allowed — required —
+    to say no: proposing the nearest thing the tools *can* build would run a
+    different campaign from the one asked for, with nothing recording the
+    substitution. `reason` is the model's own statement of what is missing.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"setup_agent: cannot run this request — {reason}")
+        self.reason = reason
 
 
 def propose_task_file(
@@ -311,6 +347,10 @@ def propose_task_file(
             messages=messages,
         )
         block = _tool_block(response)
+        refusal = dict(block.input).get("cannot_run")
+        if refusal:
+            candidate.unlink(missing_ok=True)
+            raise SetupRefused(str(refusal))
         rendered = to_yaml(dict(block.input))
 
         out_path.parent.mkdir(parents=True, exist_ok=True)

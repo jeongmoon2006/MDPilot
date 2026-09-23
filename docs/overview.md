@@ -89,7 +89,7 @@ flowchart TD
     %% ------------------------------------------------------------ guards
     subgraph GUARD["Code overrules the model"]
         G1["cited values checked against the report<br/>misquote → sent back; 3 strikes → extend, note withheld"]
-        G2["stop refused unless fes_converged=true<br/>or the budget is spent"]
+        G2["stop refused unless precision.gate is true<br/>AND no falsifier is refuted or not_evaluable<br/>(or the budget is spent)"]
         G3["budget caps, extension clamps, switch allowance<br/>all recounted from disk on resume"]
         G4["config lock: seed, spec, engine, expectation,<br/>thresholds, min_recrossings, wall, bias shape"]
     end
@@ -280,6 +280,12 @@ The stop rule is enforced in code, not only in the prompt: a `stop` while
 ledger as a refusal (`_refuse_premature_stop`).
 
 ### 4.4 Correct, not just converged — three layers
+
+> **Superseded 2026-09-22.** This section describes the agent before the
+> validity / precision / correctness reframing. The current design is in
+> `falsifiers.md`: the three "layers" below became three report blocks, and
+> the in-loop checks became falsifiers that can only refute. Kept for the
+> record of why.
 
 *Converged* means the estimate stopped moving. It says nothing about whether
 it stopped at the right answer. A bias that fills a degenerate basin the CV

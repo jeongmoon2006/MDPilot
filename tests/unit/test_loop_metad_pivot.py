@@ -20,6 +20,7 @@ from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.memory import store
 from mdpilot.orchestrator import loop as loop_mod
 from mdpilot.orchestrator.loop import run_campaign
+from mdpilot.diagnostics.report import has_report_field, report_field
 from mdpilot.orchestrator.scientist import Decision, MetadProposal
 
 
@@ -435,13 +436,14 @@ def test_biased_round_gets_the_free_energy_report_not_the_equilibrium_one(
 
     vanilla, biased = result.rounds[0].report, result.rounds[1].report
     assert vanilla["phase"] == "vanilla"
-    assert vanilla["ess"] == 5.0
+    assert report_field(vanilla, "ess") == 5.0
 
     assert biased["phase"] == "metad"
-    assert biased["fes_converged"] is True
-    assert biased["recrossings"] == 3
+    assert report_field(biased, "fes_converged") is True
+    assert report_field(biased, "gate") is True
+    assert report_field(biased, "recrossings") == 3
     for equilibrium_field in ("ess", "plateau_reached", "exploring", "n_basins"):
-        assert equilibrium_field not in biased, equilibrium_field
+        assert not has_report_field(biased, equilibrium_field), equilibrium_field
 
     # The scientist was offered the matching action space each round.
     assert record["phases"] == ["vanilla", "metad"]
@@ -472,7 +474,7 @@ def test_prior_round_summaries_do_not_leak_equilibrium_fields_from_biased_rounds
     assert "ess" in vanilla_summary
 
     assert biased_summary["phase"] == "metad"
-    assert biased_summary["fes_converged"] is True
+    assert biased_summary["precision_gate"] is True
     assert "ess" not in biased_summary
     assert "plateau_reached" not in biased_summary
 
@@ -1255,10 +1257,10 @@ def test_the_biased_report_says_where_the_walker_was_this_round(
         state_thresholds=(0.3, 0.7),
     )
 
-    assert report["observable_min_this_round"] == pytest.approx(0.03)
-    assert report["observable_max_this_round"] == pytest.approx(0.13)
+    assert report_field(report, "observable_min_this_round") == pytest.approx(0.03)
+    assert report_field(report, "observable_max_this_round") == pytest.approx(0.13)
     # Entirely inside one state — the signal the cumulative range cannot give.
-    assert report["observable_max_this_round"] < 0.3
+    assert report_field(report, "observable_max_this_round") < 0.3
     # The recrossing count is still taken against the cumulative series.
     assert captured["observable"].size == 100
 
@@ -1338,14 +1340,17 @@ def test_a_contact_space_trap_is_detected_and_escaped(tmp_path, monkeypatch) -> 
     )
 
     biased = [r for r in record["reports"] if r.get("phase") == "metad"]
-    confined = [(r.get("confined_to_state"), r.get("rounds_confined")) for r in biased]
+    confined = [
+        (report_field(r, "confined_to_state"), report_field(r, "rounds_confined"))
+        for r in biased
+    ]
 
     # Rounds 2 and 3 traverse the bands; 4 and 5 are stuck below the low one.
     assert confined[:2] == [(None, 0), (None, 0)]
     assert confined[2] == ("low", 1)
     assert confined[3] == ("low", 2)          # the trap is now unambiguous
     # And the surface kept deepening while it sat there.
-    assert [r["fes_depth_kj_per_mol"] for r in biased][:4] == [51.0, 92.0, 116.0, 131.0]
+    assert [report_field(r, "fes_depth_kj_per_mol") for r in biased][:4] == [51.0, 92.0, 116.0, 131.0]
 
     # The escape actually happened: a fresh bias on the replacement coordinate.
     assert "switch_cv" in [r.decision.decision for r in result.rounds]
@@ -1396,8 +1401,9 @@ def test_the_report_tells_the_scientist_what_allowance_is_left(
     )
 
     biased = [r for r in record["reports"] if r.get("phase") == "metad"]
-    assert biased[0]["cv_switches_remaining"] == 1
-    assert biased[-1]["cv_switches_used"] == 1 and biased[-1]["cv_switches_remaining"] == 0
+    assert report_field(biased[0], "cv_switches_remaining") == 1
+    assert report_field(biased[-1], "cv_switches_used") == 1
+    assert report_field(biased[-1], "cv_switches_remaining") == 0
 
 
 def test_wall_warnings_reach_the_scientist_through_the_ledger(
@@ -1679,7 +1685,7 @@ def test_rounds_since_visited_counts_the_walker_that_never_comes_back(tmp_path: 
     _write_obs(rounds, 4, 0.030, 0.547)
     _write_obs(rounds, 5, 0.164, 0.529)   # dips into unfolded, never above 0.7
 
-    assert loop_mod._confinement(rounds, 5, (0.3, 0.7)) == (None, 0)          # the old signal
+    assert loop_mod._confinement(rounds, 5, (0.3, 0.7)) == (None, 0, 0)       # the old signal
     assert loop_mod._rounds_since_visited(rounds, 5, (0.3, 0.7)) == (0, 3)     # the new one
     assert loop_mod._rounds_since_visited(rounds, 2, (0.3, 0.7)) == (0, 0)
     assert loop_mod._rounds_since_visited(rounds, 5, None) == (None, None)
@@ -1801,17 +1807,23 @@ def test_a_biased_round_reports_the_surface_on_the_observable(tmp_path: Path, mo
         # the observable is that distance in Angstrom: PLUMED's nm column x 10
         observable=ObservableSpec(cv_type="distance", selections=("index 0", "index 1"),
                                   name="d_angstrom", scale=10.0),
-        max_rounds=3,
+        # Two rounds: five COLVAR rows cannot support the time-window falsifier,
+        # so the stop is refused (not_evaluable) and the campaign ends on
+        # max_rounds instead — which is the rule doing its job.
+        max_rounds=2,
         **_run_kwargs(),
     )
 
     report = result.rounds[1].report
     assert report["phase"] == "metad"
-    surface = load_fes(Path(report["observable_fes_path"]))
+    surface = load_fes(Path(report_field(report, "observable_fes_path")))
     assert surface.cv_label == "d_angstrom"
     assert 3.0 <= surface.cv.min() and surface.cv.max() <= 7.0     # 0.3-0.7 nm, in Angstrom
     assert surface.free_energy.min() == 0.0
-    assert "delta_g_low_minus_high_kj_per_mol" in report
+    assert has_report_field(report, "delta_g_low_minus_high_kj_per_mol")
+    assert "time_window_invariance" in report["correctness"]["summary"]["not_evaluable"]
+    assert result.rounds[1].decision.decision == "extend"          # the stop was refused
+    assert result.stop_reason == "max_rounds_reached"
     written.update(report)
 
 
@@ -1889,8 +1901,8 @@ def test_add_cv_keeps_the_deposited_hills_and_biases_in_parallel(
     pivot = next(p for n, p in events if n == "pivot" and p["kind"] == "add_cv")
     assert pivot["biased_cvs"] == [_proposal().label, _added().label]
     # both revisions draw on one allowance
-    assert result.rounds[2].report["cv_switches_used"] == 1
-    assert result.rounds[1].report["cv_switches_remaining"] == 2 - 0
+    assert report_field(result.rounds[2].report, "cv_switches_used") == 1
+    assert report_field(result.rounds[1].report, "cv_switches_remaining") == 2 - 0
 
 
 def test_a_switch_after_an_add_drops_every_hills_file(tmp_path: Path, monkeypatch) -> None:
@@ -2013,3 +2025,69 @@ def test_absence_is_counted_in_frames_as_well_as_rounds(tmp_path: Path) -> None:
 
     assert absence["high"] == (2, 100)     # two rounds, 100 frames away from the folded state
     assert absence["low"] == (0, 0)
+
+
+# ---------- walls: one label per coordinate, printed to COLVAR ----------
+
+def test_two_walled_length_cvs_render_distinct_wall_actions_and_print_their_bias(
+    tmp_path: Path,
+) -> None:
+    """An `add_cv` beside a walled length CV used to render two `uwall:`
+    actions, which PLUMED refuses at init — after the engine was built and on
+    every resume. Each wall is now labelled by its coordinate, and its bias
+    column is printed so the reweighting can account for it."""
+    traj, top = _two_atom_traj(tmp_path)
+    d = MetadProposal(cv_type="distance", selections=("name A", "name B"), label="d")
+    rg = MetadProposal(cv_type="gyration", selections=("all",), label="rg")
+
+    text = loop_mod._build_plumed_input(
+        [d, rg], traj, top, tmp_path, temperature_k=300.0, cv_upper_wall_nm=0.8,
+    )
+
+    assert "uwall_d: UPPER_WALLS ARG=d " in text
+    assert "uwall_rg: UPPER_WALLS ARG=rg " in text
+    print_line = next(ln for ln in text.splitlines() if ln.startswith("PRINT"))
+    assert "pb.bias,uwall_d.bias,uwall_rg.bias" in print_line
+
+
+def test_the_reweighting_sums_every_bias_column_and_keeps_the_walls_share(tmp_path: Path) -> None:
+    """Frames the wall was pushing on used to be reweighted by the metadynamics
+    bias alone, as if the wall were physics."""
+    from mdpilot.observables import COLVAR_OBSERVABLE_LABEL, ObservableSpec
+
+    _, top = _two_atom_traj(tmp_path)
+    columns = {
+        "time": np.arange(4.0),
+        "d": np.full(4, 0.5),
+        COLVAR_OBSERVABLE_LABEL: np.array([0.3, 0.4, 0.5, 0.6]),
+        "metad.bias": np.array([1.0, 2.0, 3.0, 4.0]),
+        "uwall_d.bias": np.array([0.0, 0.0, 5.0, 5.0]),
+    }
+    spec = ObservableSpec(cv_type="distance", selections=("name A", "name B"),
+                          name="d_angstrom", scale=10.0)
+
+    series, total, wall = loop_mod._colvar_observable_and_bias(columns, top, spec)
+
+    assert series == pytest.approx([3.0, 4.0, 5.0, 6.0])       # in the observable's units
+    assert total == pytest.approx([1.0, 2.0, 8.0, 9.0])        # metad + wall
+    assert wall == pytest.approx([0.0, 0.0, 5.0, 5.0])
+    assert loop_mod._colvar_observable_and_bias({"time": np.zeros(1)}, top, spec) == (None, None, None)
+
+
+def test_a_scripted_policy_replaces_the_scientist_when_given(tmp_path: Path, monkeypatch) -> None:
+    """`decide_fn` is the fault-injection suite's hook: the module-level
+    scientist is not called at all."""
+    _stub_collaborators(monkeypatch, [])                      # module `decide` would raise on pop
+    calls: list[str] = []
+
+    def policy(report, *, phase="vanilla", **_):  # noqa: ANN001
+        calls.append(phase)
+        return _stop()
+
+    result = run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_rounds=3, decide_fn=policy, **_run_kwargs(),
+    )
+
+    assert calls == ["vanilla"]
+    assert result.stop_reason == "scientist_said_stop"

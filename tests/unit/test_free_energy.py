@@ -490,3 +490,19 @@ def test_reweighting_refuses_misaligned_inputs() -> None:
 
     with pytest.raises(ValueError, match="frames but"):
         reweighted_profile(np.zeros(10), np.zeros(9))
+
+
+def test_a_hills_file_with_no_hills_yet_yields_a_report_not_a_segfault(tmp_path: Path) -> None:
+    """A first biased round shorter than one deposition interval leaves a
+    header-only HILLS. `plumed sum_hills` exits -11 on it; the fault-injection
+    dry run found that. The report says there is nothing to integrate."""
+    from mdpilot.diagnostics.free_energy import metad_report
+
+    hills = tmp_path / "HILLS"
+    hills.write_text("#! FIELDS time q_ca sigma_q_ca height biasf\n#! SET multivariate false\n")
+
+    report = metad_report(hills, None, tmp_path / "fes", min_recrossings=2)
+
+    assert report["n_fes_estimates"] == 0 and report["cv_label"] == "q_ca"
+    assert report["fes_drift_kj_per_mol"] is None and report["fes_converged"] is None
+    assert report["min_recrossings"] == 2 and "no hills" in report["note"]

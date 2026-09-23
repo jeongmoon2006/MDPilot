@@ -75,6 +75,8 @@ from typing import Any, Callable, Literal
 import anthropic
 from dotenv import load_dotenv
 
+from mdpilot.diagnostics.report import has_report_field, report_field
+
 load_dotenv()
 
 _MODEL = "claude-sonnet-4-6"
@@ -133,8 +135,11 @@ def _chunk(name: str) -> str:
         ) from e
 
 
+View = Literal["gated", "raw"]
+
+
 def knowledge_keys(
-    phase: Phase, *, can_propose_cv: bool, allow_cv_switch: bool
+    phase: Phase, *, can_propose_cv: bool, allow_cv_switch: bool, view: View = "gated"
 ) -> tuple[str, ...]:
     """Which knowledge chunks this round needs, in assembly order.
 
@@ -144,27 +149,35 @@ def knowledge_keys(
     keep it in step with the tool selected in `decide`; `test_scientist` pins
     the two together.
 
-    Always-on chunks come first so the four variants share the longest possible
+    `view` selects the prompt family. `gated` is the campaign's: it names the
+    report's verdicts and states and the rule that reads them. `raw` is the
+    ablation's `lm_only` arm (`mdpilot.ablation`): the model sees statistics
+    with no tolerances, flags or gate verdicts, so its prompt must name none
+    either — a threshold smuggled in as prose would be a gate by another
+    route. `tests/unit/test_ablation.py` checks the raw prompt for that.
+
+    Always-on chunks come first so the variants share the longest possible
     cache prefix.
     """
-    keys = ["role", f"phase_{phase}"]
+    suffix = "_raw" if view == "raw" else ""
+    keys = [f"role{suffix}", f"phase_{phase}{suffix}"]
     if allow_cv_switch:
-        keys.append("action_switch_cv")
-        keys.append("action_add_cv")
+        keys.append(f"action_switch_cv{suffix}")
+        keys.append(f"action_add_cv{suffix}")
     if can_propose_cv:
         keys.append("cv_vocabulary")
-    keys.append("output_contract")
+    keys.append(f"output_contract{suffix}")
     return tuple(keys)
 
 
 def build_system_prompt(
-    phase: Phase, *, can_propose_cv: bool, allow_cv_switch: bool
+    phase: Phase, *, can_propose_cv: bool, allow_cv_switch: bool, view: View = "gated"
 ) -> str:
     """Assemble the round's system prompt from the knowledge base."""
     return "\n\n".join(
         _chunk(k)
         for k in knowledge_keys(
-            phase, can_propose_cv=can_propose_cv, allow_cv_switch=allow_cv_switch
+            phase, can_propose_cv=can_propose_cv, allow_cv_switch=allow_cv_switch, view=view
         )
     )
 
@@ -181,7 +194,11 @@ _CITED_SCHEMA = {
         "properties": {
             "field": {
                 "type": "string",
-                "description": "A key of diagnostic_report.",
+                "description": (
+                    "A key of diagnostic_report: a leaf name such as "
+                    "`recrossings`, or a dotted path such as "
+                    "`correctness.falsifiers.time_window_invariance.magnitude`."
+                ),
             },
             "value": {
                 # Strings too: `confined_to_state` is "high" / "low" / null,
@@ -306,9 +323,10 @@ _METAD_DECISION_TOOL = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "One to three sentences citing the specific free-energy "
-                    "numbers that drove the decision (fes_drift_kj_per_mol, "
-                    "recrossings, fes_converged)."
+                    "One to three sentences citing the specific numbers that "
+                    "drove the decision: precision.fes_drift_kj_per_mol, "
+                    "precision.recrossings, precision.gate, and any falsifier "
+                    "whose state is refuted or not_evaluable."
                 ),
             },
             "extra_ns": {
@@ -491,6 +509,18 @@ class MisquotedReport(DecisionRefused):
     """The values the model cited disagree with the report it was given."""
 
 
+class MalformedDecision(DecisionRefused):
+    """The tool call broke the contract the schema cannot express — a CV
+    revision with no proposal, or a proposal on an action that takes none.
+
+    Was a bare `RuntimeError` out of the parser, which ended a live round
+    after its MD was spent and, in the ablation, ended the whole replay. It is
+    the same shape as a misquote — the model has to call the tool again — so
+    it is handled the same way: sent back as a tool error, retried, and after
+    `max_attempts` converted to an extend by the loop.
+    """
+
+
 def decide(
     diagnostic_report: dict[str, Any],
     *,
@@ -504,6 +534,7 @@ def decide(
     max_attempts: int = _MAX_PROPOSAL_ATTEMPTS,
     client: anthropic.Anthropic | None = None,
     model: str = _MODEL,
+    view: View = "gated",
 ) -> Decision:
     """Single Claude call: diagnostic + context → next-action decision.
 
@@ -563,7 +594,7 @@ def decide(
     # second condition to keep in step.
     can_propose_cv = "metad_proposal" in tool["input_schema"]["properties"]
     system_prompt = build_system_prompt(
-        phase, can_propose_cv=can_propose_cv, allow_cv_switch=allow_cv_switch
+        phase, can_propose_cv=can_propose_cv, allow_cv_switch=allow_cv_switch, view=view
     )
     payload = {
         "round_index": (len(prior_round_summaries) if prior_round_summaries else 0) + 1,
@@ -597,11 +628,22 @@ def decide(
             messages=messages,
         )
         block = _tool_block(response)
-        decision = _parse_decision(block.input)
-
         refusal: type[DecisionRefused] | None = None
-        error = check_citations(decision.cited, diagnostic_report)
-        if error is not None:
+        error: str | None = None
+        try:
+            decision = _parse_decision(block.input)
+        except RuntimeError as e:
+            decision = _placeholder_decision(block.input)
+            refusal, error = MalformedDecision, str(e)
+            feedback = (
+                "The decision breaks the tool's contract. Fix it and call the "
+                f"tool again.\n\n{error}"
+            )
+        if refusal is None:
+            error = check_citations(decision.cited, diagnostic_report)
+        if refusal is not None:
+            pass
+        elif error is not None:
             refusal = MisquotedReport
             feedback = (
                 "Values you cited disagree with diagnostic_report. Re-read the "
@@ -660,10 +702,10 @@ def check_citations(
     """
     problems: list[str] = []
     for field, value in cited:
-        if field not in report:
+        if not has_report_field(report, field):
             problems.append(f"`{field}`: cited {value!r}, but the report has no such field")
             continue
-        actual = report[field]
+        actual = report_field(report, field)
         if isinstance(actual, str):
             # Labels and paths: exact when the model quotes one, ignored when
             # it does not — these are not numbers to misread, and the check
@@ -696,6 +738,17 @@ def _tool_block(response: Any) -> Any:
 
 
 _PROPOSAL_ACTIONS = frozenset({"switch_to_metad", "switch_cv", "add_cv"})
+
+
+def _placeholder_decision(data: dict[str, Any]) -> Decision:
+    """What the model asked for, as far as it can be read, for the refusal to
+    carry: the loop's fallback needs the action name and the reason."""
+    return Decision(
+        decision=data.get("decision", "extend"),
+        reason=str(data.get("reason", "")),
+        extra_ns=data.get("extra_ns"),
+        ledger_note=data.get("ledger_note"),
+    )
 
 
 def _parse_decision(data: dict[str, Any]) -> Decision:

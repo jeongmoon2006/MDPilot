@@ -1,10 +1,10 @@
 === PHASE `metad` — well-tempered metadynamics ===
 
-Action space is `extend` or `stop`, and — only when `switch_cv` appears in the
-`decision` enum of your tool — `switch_cv`. When it is absent the campaign has
-spent its CV-revision allowance and the choice is not yours to make; do not
-argue for it. Proposing another *pivot* is never available: the campaign has
-already pivoted.
+Action space is `extend` or `stop`, and — only when they appear in the
+`decision` enum of your tool — `switch_cv` and `add_cv`. When they are absent
+the campaign has spent its CV-revision allowance and the choice is not yours
+to make; do not argue for it. Proposing another *pivot* is never available:
+the campaign has already pivoted.
 
 The equilibrium convergence fields are deliberately absent from this report. A
 biased trajectory is not an equilibrium ensemble — the bias drives the
@@ -12,76 +12,82 @@ observable — so a long autocorrelation would mean the bias is still filling
 and a bimodal marginal would mean the bias worked, not that the system is
 sampling freely. Do not ask for those numbers or reason as if you had them.
 
-Report fields, all derived from the deposited bias (HILLS) integrated into a
-free-energy surface:
+`validity` — bookkeeping about the run: `biased_cvs` (the coordinate(s)
+currently biased; after `add_cv` several are biased in parallel and
+`cv_ranges` gives the range each covered), `cv_label` (the primary
+coordinate the surface fields describe — the campaign observable's own
+marginal when it is among the biased ones, otherwise the first), `cv_start`,
+`cv_min`, `cv_max` (the range the walker visited over the *whole* biased
+phase — cumulative, so they go on reporting the widest excursion the
+campaign ever made long after the walker has stopped moving), and
+`n_fes_estimates`.
+
+`precision` — has the surface stopped moving, all from the deposited bias
+(HILLS) integrated into a free-energy surface:
 
 - `fes_drift_kj_per_mol` — how much the surface changed between the half-way
-cumulative estimate and the latest one. The standard well-tempered
-convergence test, taken over a gap long enough to move: consecutive estimates
-are a fraction of a percent of the run apart and barely differ however
-unconverged the surface is.
-- `recrossings` — barrier crossings, counted with hysteresis between
-`recrossing_low` and `recrossing_high`. `barrier_crossed` is `recrossings >=
-1`. `recrossing_basis` says what those boundaries are:
-- `task_states` — the states your task defines, measured on
-`recrossing_observable`, which is usually *not* the CV you are biasing. Fixed
-for the whole campaign, so the count is comparable across rounds and across a
-change of CV. Trust this one.
-- `fes_basins` — the two deepest basins of the *current* surface. These move
-as the bias fills, so a count on this basis means something different every
-round; compare the boundaries against your task's states before reading it.
-- `recrossings` may be `null`, meaning the count could not be taken at all
-(fewer than two basins resolved on the surface). That is not the same as zero
-crossings. Do not treat a null as evidence the walker stayed put — check
-`cv_min`/`cv_max` against `cv_start` to see how far it has actually moved.
-- `fes_converged` — true only when drift is below kT (≈2.5 kJ/mol at 300 K)
-AND `recrossings >= min_recrossings`, which the report states alongside it: 1
+cumulative estimate and the latest one. The standard well-tempered test,
+taken over a gap long enough to move.
+- `recrossings` — transitions counted with hysteresis between
+`recrossing_low` and `recrossing_high` on the task's own states
+(`recrossing_basis=task_states`), measured on `recrossing_observable`, which
+is usually *not* the CV you are biasing. Fixed for the whole campaign, so the
+count is comparable across rounds and across a change of CV. `null` means
+the count could not be taken at all; that is not zero crossings.
+- `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol` — shape of the
+surface so far; depth is measured over the visited range only.
+- `gate` — true only when drift is below kT (≈2.5 kJ/mol at 300 K) AND
+`recrossings >= min_recrossings`, which the report states alongside it: 1
 accepts a one-way crossing, 2 requires a full round trip so the reverse
-barrier is sampled too. Low drift *alone* is not convergence: a walker that
+barrier is sampled too. Low drift *alone* is not stability: a walker that
 never left its starting basin produces a surface that stops changing
-immediately, because nothing new is being sampled.
-- `observable_min_this_round` / `observable_max_this_round` — the range the
-walker covered on the task observable *in this round alone*. Compare them
-against `recrossing_low`/`recrossing_high`: a range that sits entirely inside
-one state, and shrinks round on round, is a walker that has settled there. That
-is the signal `cv_min`/`cv_max` cannot give you — those are cumulative over the
-whole biased phase, so they go on reporting the widest excursion the campaign
-ever made long after the walker stopped moving. If the per-round range has
-collapsed into one state while `fes_depth_kj_per_mol` keeps growing, the bias
-is filling a basin the coordinate cannot lead the system out of: say so in
-`reason` and record it in `ledger_note`.
-- `biased_cvs` — the coordinate(s) currently biased. One until you escalate;
-after `add_cv` several are biased in parallel, and `cv_ranges` then gives the
-range each covered over the biased phase so far, so a coordinate that is not
-moving is visible as such. The surface fields above describe the *primary*
-coordinate: the campaign observable's own marginal when it is among the
-biased ones, otherwise the first.
-- `ns_since_low_visited` / `ns_since_high_visited` — how long, in
-nanoseconds of biased simulation counting this round, the walker has been
-away from that state; `rounds_since_*` is the same absence in rounds. 0
-means it was there this round. This is the trap seen from the other side:
-`rounds_confined` catches a walker parked inside one state, this catches one
-roaming the disordered region without ever returning to the state it started
-from — which reads as "exploring" on the per-round range and is not.
-- `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol`,
-`n_fes_estimates` — shape of the surface recovered so far. `cv_min` and
-`cv_max` are the range the walker actually visited, and `fes_depth` is
-measured over that range only, not over the wider grid `sum_hills` writes.
+immediately. A true gate says the estimate is stable. It does not say the
+estimate is the one intended — that is the correctness block's question.
+
+`correctness.answer` — `delta_g_low_minus_high_kj_per_mol` on the campaign
+observable, integrated over the task's two states, reweighted from COLVAR.
+Positive means the high state is the more stable one.
+
+`correctness.falsifiers` — the fixed set, every round. Read each one's
+`state`, then `magnitude` against `tolerance`, then `inputs`:
+
+- `seed_invariance` — a second walker started in the other state must reach
+the same ΔG. `not_applicable` on a single-walker campaign: hysteresis is
+untested, and you should say so in `ledger_note` when it matters.
+- `estimator_invariance` — the hills marginal and the reweighted surface must
+agree, when the observable is among the biased coordinates.
+- `time_window_invariance` — ΔG from the last half of the biased phase must
+agree with ΔG from all of it. Refuted means the answer is still walking.
+- `occupancy_invariance` — under a bias that has flattened the surface the
+walker keeps visiting both states. Its `inputs` carry the per-round view the
+cumulative ranges cannot give you: `observable_min_this_round` /
+`observable_max_this_round`, `confined_to_state` and `rounds_confined` (a
+walker parked entirely inside one state), and `ns_since_low_visited` /
+`ns_since_high_visited` (a walker roaming without returning to the state it
+started in — `start_state`). Its `tolerance` is in nanoseconds and comes from
+the task file. Refuted means the biased coordinate cannot bring the system
+back; the bias is filling a region the coordinate cannot lead it out of.
+- `state_definition_invariance` — ΔG must be stable when each threshold is
+moved by half a band. Refuted means the states are not separated by a barrier
+on this observable.
+- `bias_accounting_invariance` — with the wall's bias accounted for, ΔG must
+not depend on whether frames beyond the wall are included. `not_applicable`
+without a wall.
+
+`correctness.summary` — `refuted`, `not_evaluable`, `not_applicable` (lists of
+names) and `not_refuted` (nothing refuted, nothing not_evaluable).
 
 Decision rule:
 
-- `fes_converged=true` → `stop`. The surface has stopped moving and the walker
-has made the number of transitions the task requires.
-- otherwise → `extend`. This includes `fes_converged=null` (not enough
-estimates or no COLVAR yet) and the low-drift/zero-recrossing case, which is
-an under-filled basin, not a converged surface.
-- If many rounds have passed with `recrossings=0` and a large
-`fes_depth_kj_per_mol`, say so in `reason` and record it in `ledger_note` —
-that pattern suggests the biased CV is not the slow coordinate. You cannot act
-on it, but a human reading the ledger can.
+- `precision.gate=true` AND `correctness.summary.not_refuted=true` → `stop`.
+The loop enforces this: a `stop` against either is converted to an extend
+and the refusal is written to your ledger.
+- otherwise → `extend`, unless a falsifier says the coordinate itself is the
+problem — see the `switch_cv` / `add_cv` sections when they are offered.
+This includes `gate=null` and every `not_evaluable`.
+- A `refuted` falsifier names what is wrong in its `note`; quote it in
+`reason` and record the diagnosis in `ledger_note`. If you cannot act on it
+(no revision left), say so — a human reading the ledger can.
 - Before treating `recrossings` as evidence about your task's transition,
 check `recrossing_low` and `recrossing_high` against the states the task
-describes. If both boundaries sit on the same side of those states, the count
-is measuring motion *within* one state rather than the transition you were
-asked for, and a non-zero count is then not evidence that the CV is working.
-Say so in `reason` and record it in `ledger_note`.
+describes.

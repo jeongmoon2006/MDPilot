@@ -88,7 +88,15 @@ _TOP_LEVEL = {
 }
 _EQUILIBRATION_KEYS = {"nvt_ps", "npt_ps", "heat_start_k", "heat_stages"}
 _EXPECTATION_KEYS = {"objective", "characteristic_timescale_ns", "timescale_source"}
-_DONE_CRITERION_KEYS = {"states", "min_recrossings", "max_biased_ns", "pivot_required"}
+_DONE_CRITERION_KEYS = {
+    "states", "min_recrossings", "max_biased_ns", "pivot_required",
+    # How long, in biased ns, the walker may be absent from the state it
+    # started in (or parked inside one state) before the occupancy falsifier
+    # refutes the coordinate. A tolerance, so it lives here rather than in
+    # the prompt: a hairpin's round trip costs ~8 ns, a binding event's may
+    # cost 50, and the check must not change to say so.
+    "absence_tolerance_ns",
+}
 _STATE_KEYS = {"name", "threshold"}
 _OBSERVABLE_KEYS = {"cv_type", "selections", "name", "scale", "normalize", "reference"}
 # Enhanced-sampling knobs, mapped straight onto `run_campaign` keywords of the
@@ -412,6 +420,8 @@ def _build_campaign(doc: dict[str, Any]) -> dict[str, Any]:
         campaign["min_recrossings"] = int(criterion["min_recrossings"])
     if "max_biased_ns" in criterion:
         campaign["max_biased_ns"] = float(criterion["max_biased_ns"])
+    if "absence_tolerance_ns" in criterion:
+        campaign["absence_tolerance_ns"] = float(criterion["absence_tolerance_ns"])
     # `state_thresholds` is (low, high) on the campaign observable — the band
     # biased-round recrossings are counted between. run_campaign refuses an
     # inverted pair, so the ordering here is load-bearing, not cosmetic.

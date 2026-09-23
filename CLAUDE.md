@@ -115,6 +115,7 @@ These encode design decisions, not aesthetic preferences. Override only with wri
 - **Do not put raw simulation logs, trajectories, or large files into the agent's context.** Tools return compact structured summaries plus filesystem paths.
 - **Do not lock to one MD engine.** Adapters exist so the scientist doesn't care whether OpenMM or GROMACS ran the simulation.
 - **Do not store campaign state in the conversation.** Hypothesis ledger, findings log, trajectory metadata go to disk via `memory/`.
+- **Do not claim a result is correct.** Diagnostics are one of three things — *validity* (did the simulation do what it claimed, mechanically), *precision* (has the estimate stopped moving), *correctness* (is it the quantity we intended) — and correctness can only be refuted, never confirmed, from inside a campaign. Every correctness check is a **falsifier**: a transformation the answer must be invariant under, plus a tolerance; its states are `refuted` / `not_refuted` / `not_evaluable`. `verified` is reserved for a match against the external reference at evaluation time and is produced nowhere in the loop. The words `correct`, `right`, `valid` do not appear as result predicates in any function name, field, log line, prompt chunk or docstring. The LLM never chooses which falsifiers run. Design in `docs/falsifiers.md` (2026-09-22).
 
 ---
 

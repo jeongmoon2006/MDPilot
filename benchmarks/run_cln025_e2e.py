@@ -61,6 +61,7 @@ from mdpilot.orchestrator.loop import (
     run_campaign,
     steps_per_ns_for,
 )
+from mdpilot.diagnostics.report import report_field
 from mdpilot.task_file import TaskFile, load_task_file
 
 _TASK_FILE = Path("benchmarks/tasks/cln025_contacts.yaml")
@@ -177,11 +178,11 @@ def verdict(
         rep = pivot.report
         out["pivot"] = {
             "round": pivot.round_index,
-            "exploring": rep.get("exploring"),
-            "n_basins": rep.get("n_basins"),
-            "bimodality_coefficient": rep.get("bimodality_coefficient"),
-            "ess": rep.get("ess"),
-            "plateau_reached": rep.get("plateau_reached"),
+            "exploring": report_field(rep, "exploring"),
+            "n_basins": report_field(rep, "n_basins"),
+            "bimodality_coefficient": report_field(rep, "bimodality_coefficient"),
+            "ess": report_field(rep, "ess"),
+            "plateau_reached": report_field(rep, "plateau_reached"),
             "cv": pivot.metad_proposal,
             "reason": pivot.reason,
         }
@@ -192,13 +193,13 @@ def verdict(
         {
             "round": r.round_index,
             "kind": r.decision,
-            "from": r.report.get("biased_cvs") or r.report.get("cv_label"),
+            "from": report_field(r.report, "biased_cvs") or report_field(r.report, "cv_label"),
             "to": r.metad_proposal,
-            "rounds_since_high_visited": r.report.get("rounds_since_high_visited"),
-            "rounds_since_low_visited": r.report.get("rounds_since_low_visited"),
-            "rounds_confined": r.report.get("rounds_confined"),
-            "fes_depth_kj_per_mol": r.report.get("fes_depth_kj_per_mol"),
-            "recrossings": r.report.get("recrossings"),
+            "rounds_since_high_visited": report_field(r.report, "rounds_since_high_visited"),
+            "rounds_since_low_visited": report_field(r.report, "rounds_since_low_visited"),
+            "rounds_confined": report_field(r.report, "rounds_confined"),
+            "fes_depth_kj_per_mol": report_field(r.report, "fes_depth_kj_per_mol"),
+            "recrossings": report_field(r.report, "recrossings"),
             "reason": r.reason,
         }
         for r in switches
@@ -340,13 +341,13 @@ def _observable_surface(
     if not biased:
         return None
     last = biased[-1]
-    if last.report.get("cv_label") == task.observable_name:
-        fes_path = last.report.get("fes_path")
+    if report_field(last.report, "cv_label") == task.observable_name:
+        fes_path = report_field(last.report, "fes_path")
         if fes_path and Path(fes_path).exists():
             surface = load_fes(Path(fes_path))
             visited = _visited_range(work_dir, biased)
             return surface.restricted_to(*visited) if visited else surface
-    path = last.report.get("observable_fes_path")
+    path = report_field(last.report, "observable_fes_path")
     if path and Path(path).exists():
         return load_fes(Path(path))
     colvar_path = last.plumed_dat_path.parent / "COLVAR"
@@ -360,7 +361,7 @@ def _observable_surface(
         return surface
     colvar = load_colvar(colvar_path)
     bias_column = next((k for k in colvar if k.endswith(".bias")), None)
-    column = last.report.get("cv_label")
+    column = report_field(last.report, "cv_label")
     if bias_column is None or column not in colvar or column != task.observable_name:
         return None
     return reweighted_profile(
@@ -395,18 +396,18 @@ def case_study(work_dir: Path, task: TaskFile, result: dict[str, Any]) -> str:
         ns = r.n_steps / steps_per_ns
         if r.plumed_dat_path is None:
             said = (
-                f"exploring={rep.get('exploring')} n_basins={rep.get('n_basins')} "
-                f"BC={_fmt(rep.get('bimodality_coefficient'))} ess={_fmt(rep.get('ess'))}"
+                f"exploring={report_field(rep, 'exploring')} n_basins={report_field(rep, 'n_basins')} "
+                f"BC={_fmt(report_field(rep, 'bimodality_coefficient'))} ess={_fmt(report_field(rep, 'ess'))}"
             )
         else:
             said = (
-                f"drift={_fmt(rep.get('fes_drift_kj_per_mol'))} "
-                f"recross={rep.get('recrossings')} "
-                f"range=[{_fmt(rep.get('observable_min_this_round'))}, "
-                f"{_fmt(rep.get('observable_max_this_round'))}] "
-                f"since_high={rep.get('rounds_since_high_visited')} "
-                f"depth={_fmt(rep.get('fes_depth_kj_per_mol'))} "
-                f"converged={rep.get('fes_converged')}"
+                f"drift={_fmt(report_field(rep, 'fes_drift_kj_per_mol'))} "
+                f"recross={report_field(rep, 'recrossings')} "
+                f"range=[{_fmt(report_field(rep, 'observable_min_this_round'))}, "
+                f"{_fmt(report_field(rep, 'observable_max_this_round'))}] "
+                f"since_high={report_field(rep, 'rounds_since_high_visited')} "
+                f"depth={_fmt(report_field(rep, 'fes_depth_kj_per_mol'))} "
+                f"converged={report_field(rep, 'fes_converged')}"
             )
         cv = (r.metad_proposal or {}).get("label", "") if r.metad_proposal else ""
         lines.append(

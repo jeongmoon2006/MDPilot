@@ -40,6 +40,8 @@ def _valid(**overrides: Any) -> dict[str, Any]:
         "min_recrossings": 2,
         "max_biased_ns": 20.0,
         "cv_upper_wall_nm": None,
+        "absence_tolerance_ns": 8.0,
+        "cannot_run": None,
     }
     payload.update(overrides)
     return payload
@@ -212,3 +214,34 @@ def test_the_forcefield_reaches_the_spec(tmp_path: Path) -> None:
 
     assert task.spec.forcefield == "charmm36/tip3p"
     assert task.spec.to_dict()["forcefield"] == "charmm36/tip3p"   # locked
+
+
+# ---------- saying no ----------
+
+def test_a_request_the_tools_cannot_run_is_refused_and_nothing_is_written(
+    tmp_path: Path,
+) -> None:
+    """The agent may only propose what this toolset can build. A request that
+    needs a missing capability is refused with the model's own statement of
+    the gap, not answered with the nearest system the tools *can* build."""
+    from mdpilot.setup_agent import SetupRefused
+
+    out = tmp_path / "task.yaml"
+    declined = _valid(cannot_run="a protein-ligand system needs small-molecule "
+                                 "parameters (GAFF/OpenFF), which are not available")
+
+    with pytest.raises(SetupRefused, match="small-molecule parameters") as info:
+        propose_task_file("bind the ligand", out, client=_FakeClient(declined))
+
+    assert "GAFF" in info.value.reason
+    assert not out.exists()
+    assert not list(tmp_path.iterdir())          # no candidate left behind either
+
+
+def test_the_tolerance_the_task_file_owns_reaches_the_done_criterion(tmp_path: Path) -> None:
+    task = propose_task_file(
+        "fold chignolin", tmp_path / "t.yaml",
+        client=_FakeClient(_valid(absence_tolerance_ns=12.0)),
+    )
+    assert task.campaign["absence_tolerance_ns"] == 12.0
+    assert yaml.safe_load((tmp_path / "t.yaml").read_text())["done_criterion"]["absence_tolerance_ns"] == 12.0

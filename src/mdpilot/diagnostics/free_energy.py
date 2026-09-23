@@ -345,6 +345,21 @@ def write_fes(fes: FreeEnergySurface, path: Path) -> Path:
     return path
 
 
+def surface_rms_kj_per_mol(a: FreeEnergySurface, b: FreeEnergySurface) -> float | None:
+    """rms(F_a − F_b) over the range both sampled, each re-zeroed to its own
+    minimum over that overlap so where `--mintozero` put zero is not counted
+    as disagreement. None when the two do not overlap."""
+    lo = max(float(a.cv.min()), float(b.cv.min()))
+    hi = min(float(a.cv.max()), float(b.cv.max()))
+    if not hi > lo:
+        return None
+    grid = np.linspace(lo, hi, 200)
+    fa = np.interp(grid, a.cv, a.free_energy)
+    fb = np.interp(grid, b.cv, b.free_energy)
+    diff = (fa - fa.min()) - (fb - fb.min())
+    return float(np.sqrt(np.mean(diff**2)))
+
+
 def reweighted_profile(
     observable: np.ndarray,
     bias_kj_per_mol: np.ndarray,
@@ -452,7 +467,32 @@ def metad_report(
 
     Same contract as `diagnostics.report.make_report`: JSON-serializable
     scalars plus filesystem paths, no arrays and no trajectory bytes.
+
+    A HILLS file with no hills yet — a first biased round shorter than one
+    deposition interval — is not an error: there is no surface to integrate,
+    and `plumed sum_hills` segfaults on it rather than saying so. The report
+    then carries the CV label from the header and `None` for every surface
+    statistic, which reads downstream as `not_evaluable`.
     """
+    n_hills, header_cv = _hills_summary(Path(hills_path))
+    if n_hills == 0 and header_cv is not None:
+        return {
+            "hills_path": str(hills_path),
+            "fes_path": None,
+            "cv_label": header_cv,
+            "cv_min": None,
+            "cv_max": None,
+            "n_fes_estimates": 0,
+            "n_basins_fes": None,
+            "barrier_kj_per_mol": None,
+            "fes_depth_kj_per_mol": None,
+            "fes_drift_kj_per_mol": None,
+            "recrossings": None,
+            "barrier_crossed": None,
+            "min_recrossings": min_recrossings,
+            "fes_converged": None,
+            "note": "no hills deposited yet; nothing to integrate",
+        }
     surfaces = sum_hills(hills_path, out_dir, stride=stride)
     final = load_fes(surfaces[-1])
 
@@ -565,6 +605,28 @@ def metad_report(
     report["min_recrossings"] = min_recrossings
     report["fes_converged"] = _fes_converged(report, temperature_k, min_recrossings)
     return report
+
+
+def _hills_summary(hills_path: Path) -> tuple[int, str | None]:
+    """(number of hill rows, the CV label from the `#! FIELDS` header).
+
+    A missing file is `(0, None)` and is *not* the header-only case: it is
+    left to `sum_hills` to report, so a caller that stubs `sum_hills` — the
+    unit tests do — is not short-circuited."""
+    n = 0
+    cv_label: str | None = None
+    if not hills_path.exists():
+        return 0, None
+    with hills_path.open() as fh:
+        for line in fh:
+            if line.startswith("#! FIELDS"):
+                fields = line.split()
+                # `#! FIELDS time <cv> sigma_<cv> height biasf`
+                if len(fields) >= 4:
+                    cv_label = fields[3]
+            elif line.strip() and not line.startswith("#"):
+                n += 1
+    return n, cv_label
 
 
 def _fes_converged(
