@@ -262,12 +262,12 @@ def test_the_envelope_says_the_unbiased_phase_is_uncapped() -> None:
 
 def test_the_budget_note_says_the_cap_replaces_the_files_value() -> None:
     """Overrides always win, in both directions. Someone could raise the cap to
-    5, believe the file's 20 ns was in force, and get a quarter of a campaign."""
+    5, believe the file's 100 ns was in force, and get a twentieth of a campaign."""
     task_yaml = Path("benchmarks/tasks/cln025_contacts.yaml").read_text()
 
-    assert "20 ns" in app._budget_note(task_yaml, 0.1)
+    assert "100 ns" in app._budget_note(task_yaml, 0.1)
     assert "0.1 ns" in app._budget_note(task_yaml, 0.1)
-    assert "matching the task file" in app._budget_note(task_yaml, 20.0)
+    assert "matching the task file" in app._budget_note(task_yaml, 100.0)
     # An unparseable editor buffer must not take the panel down.
     assert app._budget_note("not: [valid", 0.1)
     assert app._budget_note("", 0.1)

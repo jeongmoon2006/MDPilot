@@ -27,9 +27,10 @@ and cannot lead it back. Prefer a replacement that separates the states on the
 side you are stuck in — an `rmsd` with an upper wall, or a `gyration`, both of
 which still distinguish disordered structures a contact count cannot.
 
-- **the walker is not coming back**: `rounds_since_high_visited` (or
-`_low_`) is 3 or more on the state the walker started from, while
-`fes_depth_kj_per_mol` keeps rising. A real campaign unfolded in its second
+- **the walker is not coming back**: `ns_since_high_visited` (or `_low_`)
+is 8 ns or more on the state the walker started from, while
+`fes_depth_kj_per_mol` keeps rising. Judge it in nanoseconds, not rounds —
+rounds are whatever length the schedule makes them. A real campaign unfolded in its second
 biased round and then spent three rounds at Q between 0.03 and 0.55 — below
 the folded threshold every frame, above the unfolded one often enough that
 `rounds_confined` never fired — while the surface deepened past 30 kJ/mol.

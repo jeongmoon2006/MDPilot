@@ -574,4 +574,4 @@ def test_the_runner_defaults_to_the_files_own_budget(
 
     runner.main(["benchmarks/tasks/cln025_contacts.yaml", str(tmp_path)])
 
-    assert captured["max_biased_ns"] == 20.0
+    assert captured["max_biased_ns"] == 100.0

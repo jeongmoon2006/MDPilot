@@ -44,7 +44,8 @@ continue rather than starting over. Run inside the conda environment via
     ~/.local/bin/micromamba run -n mdpilot \\
         python -m benchmarks.generate_cln025_reference             # ~12 h on a GTX 1660
 
-Output, under `benchmarks/data/cln025/` (gitignored, regenerable):
+Output, under `benchmarks/data/cln025/<forcefield>/` (gitignored, regenerable;
+the force field is part of the reference's identity):
     reference_fes.dat   the final sum_hills surface, F(Q) in kJ/mol
     reference.json      what it is: length, seed, SIGMA, drift, recrossings,
                         ΔG between the task's states, and the pass verdict
@@ -91,6 +92,16 @@ from mdpilot.task_file import load_task_file
 
 _TASK_FILE = Path("benchmarks/tasks/cln025_contacts.yaml")
 _DATA_DIR = Path("benchmarks/data/cln025")
+
+
+def forcefield_slug(forcefield: str) -> str:
+    return forcefield.replace("/", "_")
+
+
+def reference_dir(forcefield: str, data_dir: Path = _DATA_DIR) -> Path:
+    """Where a reference for this force field lives. A reference is a property
+    of the force field as much as of the system; one per pair, never shared."""
+    return data_dir / forcefield_slug(forcefield)
 _REFERENCE_SEED = 7          # not the campaign's 42: an independent realization
 _VANILLA_NS = 0.2            # what SIGMA is sized from, as at a campaign's pivot
 _FRAME_PS = 20.0             # trajectory kept sparse; COLVAR carries the observable
@@ -111,10 +122,18 @@ def build_reference(
     seed: int,
     min_recrossings: int,
     bias_cv: str = "observable",
-    data_dir: Path = _DATA_DIR,
+    check_every: int = 10,
+    data_dir: Path | None = None,
+    dry_run: bool = False,
     task_file: Path = _TASK_FILE,
 ) -> dict[str, Any]:
     task = load_task_file(task_file)
+    if data_dir is None:
+        # Namespaced by force field even for a dry run: the adapter reuses a
+        # cached System in its work dir without checking what built it.
+        data_dir = reference_dir(task.spec.forcefield)
+        if dry_run:
+            data_dir = data_dir / "dryrun"
     observable = task.campaign.get("observable")
     assert observable is not None, "the task file must declare the observable"
     low, high = task.campaign["state_thresholds"]
@@ -209,11 +228,105 @@ def build_reference(
          f"HEIGHT={bias.height:.3g} PACE={bias.pace} gamma={bias.bias_factor:g}"
          + (f"; wall at {walls[0].at:g}" if walls else ""))
 
-    # --- biased: chunked, checkpointed, resumable ---
+    # --- integrate and judge, at checkpoints and at the end ---
+    kt = _KB_KJ_PER_MOL_K * temperature_k
+    band = high - low
+    # Convergence is judged where the task lives — between the states and
+    # half a band beyond each — not over the whole grid. The far edge of the
+    # unfolded ensemble on a contact fraction is one bin that deepens for as
+    # long as the walker sits in it, and a whole-range max |ΔF| never settles
+    # there; the reference's job is the region the campaign is scored on.
+    judge_lo, judge_hi = low - 0.5 * band, high + 0.5 * band
+    factor = colvar_to_observable_factor(observable, observable_cv)
+
+    def judge(ns_done: float) -> tuple[dict[str, Any], Any]:
+        # For `rmsd` the biased CV's own hills carry the drift test; the
+        # surface on the observable comes from reweighting instead.
+        hills = work_dir / (hills_for_surface or bias.hills_file)
+        n_hills = sum(
+            1 for line in hills.read_text().splitlines() if line and not line.startswith("#")
+        )
+        stride = max(10, n_hills // 500)
+        surfaces = sum_hills(hills, work_dir / "fes", stride=stride)
+        final_biased = load_fes(surfaces[-1])
+        baseline = (
+            load_fes(surfaces[_baseline_index(len(surfaces))]) if len(surfaces) >= 2 else None
+        )
+        tail = load_fes(surfaces[int(0.8 * len(surfaces)) - 1]) if len(surfaces) >= 5 else None
+        colvar_columns = load_colvar(work_dir / "COLVAR")
+        series = colvar_columns[observable_column] * factor
+        bias_series = colvar_columns[bias.bias_value]
+        if hills_for_surface is not None:
+            final = _in_observable_units(final_biased, factor)
+            # Drift on the observable's own marginal, in its units, over the
+            # task-relevant range.
+            crop = lambda f: _in_observable_units(f, factor).restricted_to(judge_lo, judge_hi)  # noqa: E731
+            drift = fes_drift_kj_per_mol(crop(baseline), crop(final_biased)) if baseline else None
+            drift_tail = fes_drift_kj_per_mol(crop(tail), crop(final_biased)) if tail else None
+        else:
+            final = reweighted_profile(series, bias_series, temperature_k, label=observable.name)
+            drift = fes_drift_kj_per_mol(baseline, final_biased) if baseline else None
+            drift_tail = fes_drift_kj_per_mol(tail, final_biased) if tail else None
+        recrossings = count_recrossings(series, low, high)
+        delta_g = delta_g_kj_per_mol(final, low, high, temperature_k)
+        # Stationarity of the reweighting: the last half against the whole.
+        half = series.size // 2
+        late = reweighted_profile(
+            series[half:], bias_series[half:], temperature_k, label=observable.name,
+        )
+        delta_g_late = delta_g_kj_per_mol(late, low, high, temperature_k)
+        dg_gap = (
+            abs(delta_g - delta_g_late)
+            if delta_g is not None and delta_g_late is not None else None
+        )
+        converged = (
+            drift_tail is not None and drift_tail < kt
+            and dg_gap is not None and dg_gap < kt
+            and recrossings >= min_recrossings
+        )
+        summary: dict[str, Any] = {
+            "task_file": str(task_file),
+            "task_sha256": task.sha256,
+            "forcefield": task.spec.forcefield,
+            "observable": observable.name,
+            "bias_cv": ",".join(bias.cv_labels),
+            "state_thresholds": [low, high],
+            "judged_range": [judge_lo, judge_hi],
+            "seed": seed,
+            "biased_ns": ns_done,
+            "sigma": list(bias.sigma),
+            "sigma_floored": getattr(bias, "sigma_floored", None),
+            "height_kj_per_mol": bias.height,
+            "pace": bias.pace,
+            "bias_factor": bias.bias_factor,
+            "temperature_k": temperature_k,
+            "n_hills": n_hills,
+            "n_fes_estimates": len(surfaces),
+            "fes_drift_kj_per_mol": drift,
+            "fes_drift_last_fifth_kj_per_mol": drift_tail,
+            "recrossings": recrossings,
+            "min_recrossings": min_recrossings,
+            # F(unfolded) - F(folded): positive means the hairpin is the stable state.
+            "delta_g_low_minus_high_kj_per_mol": delta_g,
+            "delta_g_low_minus_high_last_half_kj_per_mol": delta_g_late,
+            "observable_min": float(series.min()),
+            "observable_max": float(series.max()),
+            "converged": converged,
+            "generated": datetime.now().isoformat(timespec="seconds"),
+        }
+        _log(f"judged at {ns_done:g} ns: drift(last fifth, task range)={drift_tail} kJ/mol "
+             f"(kT={kt:.2f}), dG={delta_g} vs last-half {delta_g_late}, "
+             f"recrossings={recrossings} (need {min_recrossings}) -> "
+             f"{'CONVERGED' if converged else 'not yet'}")
+        return summary, final
+
+    # --- biased: chunked, checkpointed, resumable; judged every `check_every` ---
     done = sorted(chunks_dir.glob("chunk_*.chk"))
     n_done = len(done)
     chunk_steps = int(chunk_ns * steps_per_ns)
     n_chunks = int(round(total_ns / chunk_ns))
+    summary: dict[str, Any] | None = None
+    final = None
     if n_done >= n_chunks:
         _log(f"all {n_chunks} chunks already on disk; integrating")
     else:
@@ -238,100 +351,26 @@ def build_reference(
             remaining = (n_chunks - i - 1) * elapsed
             _log(f"chunk {i + 1}/{n_chunks} ({(i + 1) * chunk_ns:g} ns) in "
                  f"{_fmt_time(elapsed)}; ~{_fmt_time(remaining)} left")
+            if check_every and (i + 1) % check_every == 0 and (i + 1) < n_chunks:
+                summary, final = judge((i + 1) * chunk_ns)
+                if summary["converged"]:
+                    _log("stopping early: the reference has converged")
+                    break
+    if summary is None or not summary["converged"]:
+        n_have = len(sorted(chunks_dir.glob("chunk_*.chk")))
+        summary, final = judge(n_have * chunk_ns)
 
-    # --- integrate and judge ---
-    # For `rmsd` the biased CV's own hills carry the drift test; the surface
-    # on the observable comes from reweighting instead.
-    hills = work_dir / (hills_for_surface or bias.hills_file)
-    colvar = work_dir / "COLVAR"
-    n_hills = sum(1 for line in hills.read_text().splitlines() if line and not line.startswith("#"))
-    stride = max(10, n_hills // 500)
-    surfaces = sum_hills(hills, work_dir / "fes", stride=stride)
-    # Drift is a property of the deposited bias, so it is measured on the
-    # biased CV's own surface whatever that CV is.
-    final_biased = load_fes(surfaces[-1])
-    baseline = load_fes(surfaces[_baseline_index(len(surfaces))]) if len(surfaces) >= 2 else None
-    drift = fes_drift_kj_per_mol(baseline, final_biased) if baseline is not None else None
-
-    # The reference surface is on the observable, in the observable's units.
-    # PLUMED's axis is the raw CV (nm, radians, a contact fraction).
-    colvar_columns = load_colvar(colvar)
-    factor = colvar_to_observable_factor(observable, observable_cv)
-    series = colvar_columns[observable_column] * factor
-    if hills_for_surface is not None:
-        final = _in_observable_units(final_biased, factor)
-    else:
-        final = reweighted_profile(
-            series, colvar_columns[bias.bias_value], temperature_k, label=observable.name,
-        )
-    recrossings = count_recrossings(series, low, high)
-    kt = _KB_KJ_PER_MOL_K * temperature_k
-    delta_g = delta_g_kj_per_mol(final, low, high, temperature_k)
-    # Stationarity check on the reweighting: the last half of the run against
-    # the whole. A gap above kT means the bias was still moving the weights.
-    half = series.size // 2
-    late = reweighted_profile(
-        series[half:], colvar_columns[bias.bias_value][half:], temperature_k,
-        label=observable.name,
-    )
-    delta_g_late = delta_g_kj_per_mol(late, low, high, temperature_k)
-
-    # The half-way drift is the campaign's per-round test and is reported, but
-    # a reference that spent its first third trapped keeps moving for a long
-    # time afterwards; what has to hold is that it has *stopped*: the surface
-    # over the last fifth of the run within kT of the final one, and the
-    # reweighted ΔG over the last half within kT of the whole-run value.
-    tail = load_fes(surfaces[int(0.8 * len(surfaces)) - 1]) if len(surfaces) >= 5 else None
-    drift_tail = fes_drift_kj_per_mol(tail, final_biased) if tail is not None else None
-    dg_gap = (
-        abs(delta_g - delta_g_late)
-        if delta_g is not None and delta_g_late is not None else None
-    )
-    converged = (
-        drift_tail is not None and drift_tail < kt
-        and dg_gap is not None and dg_gap < kt
-        and recrossings >= min_recrossings
-    )
-    summary: dict[str, Any] = {
-        "task_file": str(task_file),
-        "task_sha256": task.sha256,
-        "observable": observable.name,
-        "bias_cv": ",".join(bias.cv_labels),
-        "state_thresholds": [low, high],
-        "seed": seed,
-        "biased_ns": n_chunks * chunk_ns,
-        "sigma": list(bias.sigma),
-        "sigma_floored": getattr(bias, "sigma_floored", None),
-        "height_kj_per_mol": bias.height,
-        "pace": bias.pace,
-        "bias_factor": bias.bias_factor,
-        "temperature_k": temperature_k,
-        "n_hills": n_hills,
-        "n_fes_estimates": len(surfaces),
-        "fes_drift_kj_per_mol": drift,
-        "fes_drift_last_fifth_kj_per_mol": drift_tail,
-        "recrossings": recrossings,
-        "min_recrossings": min_recrossings,
-        # F(unfolded) - F(folded): positive means the hairpin is the stable state.
-        "delta_g_low_minus_high_kj_per_mol": delta_g,
-        "delta_g_low_minus_high_last_half_kj_per_mol": delta_g_late,
-        "observable_min": float(series.min()),
-        "observable_max": float(series.max()),
-        "converged": converged,
-        "generated": datetime.now().isoformat(timespec="seconds"),
-    }
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "reference.json").write_text(json.dumps(summary, indent=2))
-    if converged:
+    if summary["converged"]:
         write_fes(final, data_dir / "reference_fes.dat")
-        _log(f"reference written: drift={drift:.2f} kJ/mol, recrossings={recrossings}, "
-             f"dG(unfolded - folded)={delta_g} kJ/mol")
+        _log(f"reference written at {summary['biased_ns']:g} ns: "
+             f"recrossings={summary['recrossings']}, "
+             f"dG(unfolded - folded)={summary['delta_g_low_minus_high_kj_per_mol']} kJ/mol")
     else:
         (data_dir / "reference_fes.dat").unlink(missing_ok=True)
-        _log(f"NOT converged: drift(half)={drift} drift(last fifth)={drift_tail} kJ/mol "
-             f"(kT={kt:.2f}), dG={delta_g} vs last-half {delta_g_late}, "
-             f"recrossings={recrossings} (need {min_recrossings}); no reference written. "
-             f"Re-run with a larger --ns to continue from the last chunk.")
+        _log("NOT converged; no reference written. Re-run with a larger --ns to "
+             "continue from the last chunk.")
     return summary
 
 
@@ -341,7 +380,10 @@ def _in_observable_units(fes: FreeEnergySurface, factor: float) -> FreeEnergySur
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ns", type=float, default=50.0, help="total biased length")
+    parser.add_argument("--ns", type=float, default=200.0,
+                        help="ceiling on biased length; stops early once converged")
+    parser.add_argument("--check-every", type=int, default=10,
+                        help="judge convergence every N chunks")
     parser.add_argument("--chunk-ns", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=_REFERENCE_SEED)
     parser.add_argument("--min-recrossings", type=int, default=4,
@@ -356,12 +398,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         summary = build_reference(
             total_ns=0.05, chunk_ns=0.01, seed=args.seed, min_recrossings=1,
-            bias_cv=args.bias, data_dir=_DATA_DIR / "dryrun",
+            bias_cv=args.bias, check_every=0, dry_run=True,
         )
     else:
         summary = build_reference(
             total_ns=args.ns, chunk_ns=args.chunk_ns, seed=args.seed,
             min_recrossings=args.min_recrossings, bias_cv=args.bias,
+            check_every=args.check_every,
         )
     print(json.dumps(summary, indent=2))
     return 0 if summary["converged"] or args.dry_run else 1

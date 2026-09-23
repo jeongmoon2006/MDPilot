@@ -56,8 +56,9 @@ range each covered over the biased phase so far, so a coordinate that is not
 moving is visible as such. The surface fields above describe the *primary*
 coordinate: the campaign observable's own marginal when it is among the
 biased ones, otherwise the first.
-- `rounds_since_low_visited` / `rounds_since_high_visited` — consecutive
-rounds, counting this one, in which the walker never entered that state. 0
+- `ns_since_low_visited` / `ns_since_high_visited` — how long, in
+nanoseconds of biased simulation counting this round, the walker has been
+away from that state; `rounds_since_*` is the same absence in rounds. 0
 means it was there this round. This is the trap seen from the other side:
 `rounds_confined` catches a walker parked inside one state, this catches one
 roaming the disordered region without ever returning to the state it started

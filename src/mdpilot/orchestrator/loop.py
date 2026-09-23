@@ -589,6 +589,7 @@ def run_campaign(
             cv_switches_used=cv_switches_used,
             max_cv_switches=max_cv_switches,
             active_cvs=active_cvs,
+            frame_ps=report_interval_steps * adapter.timestep_fs / 1000.0,
         )
         _emit(on_event, "report", round_index=round_idx, report=report)
         prior_summaries = [_compact_prior(r) for r in rounds]
@@ -916,6 +917,7 @@ def _round_report(
     cv_switches_used: int = 0,
     max_cv_switches: int = 0,
     active_cvs: list[MetadProposal] | None = None,
+    frame_ps: float | None = None,
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
 
@@ -999,11 +1001,16 @@ def _round_report(
         # folded threshold of 0.7 every frame, straddling the unfolded one at
         # 0.3 — and reported `rounds_confined=0` throughout while the scientist
         # wrote "did not reach the folded state" three times and extended.
-        since_low, since_high = _rounds_since_visited(
-            rounds_dir, round_index, state_thresholds
-        )
-        report["rounds_since_low_visited"] = since_low
-        report["rounds_since_high_visited"] = since_high
+        absence = _absence(rounds_dir, round_index, state_thresholds)
+        report["rounds_since_low_visited"] = absence["low"][0]
+        report["rounds_since_high_visited"] = absence["high"][0]
+        # The same absence in nanoseconds. Rounds are whatever length the
+        # schedule makes them — three rounds of 2 ns and three of 5 ns are not
+        # the same wait — so the scientist's trigger is stated in time, and a
+        # longer extension schedule does not push the revision later.
+        if frame_ps is not None:
+            report["ns_since_low_visited"] = absence["low"][1] * frame_ps / 1000.0
+            report["ns_since_high_visited"] = absence["high"][1] * frame_ps / 1000.0
     colvar_path = bias_dir / _COLVAR_NAME
     if state_thresholds is not None and colvar_path.exists():
         profile = observable_surface_from_colvar(
@@ -1121,23 +1128,22 @@ def observable_surface_from_colvar(
     )
 
 
-def _rounds_since_visited(
-    rounds_dir: Path | None,
-    round_index: int | None,
-    state_thresholds: tuple[float, float] | None,
-) -> tuple[int | None, int | None]:
-    """Consecutive biased rounds, ending with this one, that never entered each state.
+def _absence(
+    rounds_dir: Path,
+    round_index: int,
+    state_thresholds: tuple[float, float],
+) -> dict[str, tuple[int, int]]:
+    """How long the walker has been away from each state: `(rounds, frames)`.
 
-    Returned as `(low, high)`. 0 means the walker entered that state this
-    round. Walks backwards over the per-round observable files exactly as
-    `_confinement` does, so the count stops at the pivot.
-
-    `None` when there is nothing to count against.
+    Consecutive biased rounds ending with this one in which the observable
+    never entered the state, and the frames they hold. 0 means the walker
+    entered that state this round. Walks backwards over the per-round
+    observable files exactly as `_confinement` does, so the count stops at
+    the pivot.
     """
-    if rounds_dir is None or round_index is None or state_thresholds is None:
-        return None, None
     low, high = float(state_thresholds[0]), float(state_thresholds[1])
-    since = {"low": 0, "high": 0}
+    rounds = {"low": 0, "high": 0}
+    frames = {"low": 0, "high": 0}
     open_ = {"low": True, "high": True}
     for index in range(round_index, 0, -1):
         path = rounds_dir / f"round_{index:03d}.obs.npy"
@@ -1150,15 +1156,30 @@ def _rounds_since_visited(
             if series.min() <= low:
                 open_["low"] = False
             else:
-                since["low"] += 1
+                rounds["low"] += 1
+                frames["low"] += int(series.size)
         if open_["high"]:
             if series.max() >= high:
                 open_["high"] = False
             else:
-                since["high"] += 1
+                rounds["high"] += 1
+                frames["high"] += int(series.size)
         if not (open_["low"] or open_["high"]):
             break
-    return since["low"], since["high"]
+    return {"low": (rounds["low"], frames["low"]), "high": (rounds["high"], frames["high"])}
+
+
+def _rounds_since_visited(
+    rounds_dir: Path | None,
+    round_index: int | None,
+    state_thresholds: tuple[float, float] | None,
+) -> tuple[int | None, int | None]:
+    """Consecutive biased rounds, ending with this one, that never entered each
+    state, as `(low, high)`. `None` when there is nothing to count against."""
+    if rounds_dir is None or round_index is None or state_thresholds is None:
+        return None, None
+    absence = _absence(rounds_dir, round_index, state_thresholds)
+    return absence["low"][0], absence["high"][0]
 
 
 def _accumulated_observable(
@@ -1636,6 +1657,8 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
             observable_max_this_round=r.report.get("observable_max_this_round"),
             rounds_since_low_visited=r.report.get("rounds_since_low_visited"),
             rounds_since_high_visited=r.report.get("rounds_since_high_visited"),
+            ns_since_low_visited=r.report.get("ns_since_low_visited"),
+            ns_since_high_visited=r.report.get("ns_since_high_visited"),
             # The boundaries move as the surface fills, so a count carried
             # forward without them is not comparable across rounds.
             recrossing_low=r.report.get("recrossing_low"),

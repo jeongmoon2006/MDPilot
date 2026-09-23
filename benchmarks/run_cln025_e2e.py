@@ -28,7 +28,7 @@ which is the anti-goal. What is required is that the campaign pivots and that
 the surface it ends with is right.
 
     export MAMBA_ROOT_PREFIX=$HOME/.micromamba
-    ~/.local/bin/micromamba run -n mdpilot python -m benchmarks.run_cln025_e2e            # ~5 h
+    ~/.local/bin/micromamba run -n mdpilot python -m benchmarks.run_cln025_e2e            # ~1 day at 100 ns
     ~/.local/bin/micromamba run -n mdpilot python -m benchmarks.run_cln025_e2e --dry-run  # minutes
     python -m benchmarks.run_cln025_e2e --verdict-only --work-dir campaigns/<existing>  # score only
 
@@ -64,8 +64,9 @@ from mdpilot.orchestrator.loop import (
 from mdpilot.task_file import TaskFile, load_task_file
 
 _TASK_FILE = Path("benchmarks/tasks/cln025_contacts.yaml")
-_REFERENCE = Path("benchmarks/data/cln025/reference_fes.dat")
-_REFERENCE_META = Path("benchmarks/data/cln025/reference.json")
+# The reference is force-field-specific; its location follows the task's.
+_REFERENCE = Path("benchmarks/data/cln025/{forcefield}/reference_fes.dat")
+_REFERENCE_META = Path("benchmarks/data/cln025/{forcefield}/reference.json")
 
 # ΔG(unfolded) - ΔG(folded) the literature supports at 300 K, kJ/mol. The
 # lower bound is the sign — the hairpin is the stable state. The upper bound
@@ -111,12 +112,14 @@ class _Trace:
         print(f"[{stamp[11:]}] {name:<14} {body}", flush=True)
 
 
-def run(task: TaskFile, work_dir: Path, *, dry_run: bool, max_rounds: int) -> None:
+def run(
+    task: TaskFile, work_dir: Path, *, dry_run: bool, max_rounds: int, max_extension_ns: float
+) -> None:
     adapter = task.build_adapter(work_dir)
     steps_per_ns = steps_per_ns_for(adapter)
     overrides: dict[str, Any] = {
         "max_rounds": max_rounds,
-        "max_extra_ns": 2.0,
+        "max_extra_ns": max_extension_ns,
         "initial_steps": int((0.05 if dry_run else 1.0) * steps_per_ns),
         "report_interval_steps": max(int(0.005 * steps_per_ns), 1),   # 5 ps/frame
     }
@@ -132,13 +135,21 @@ def run(task: TaskFile, work_dir: Path, *, dry_run: bool, max_rounds: int) -> No
 # The verdict. Reads a finished (or interrupted) campaign off disk.
 # --------------------------------------------------------------------------
 
+def _for_forcefield(template: Path, task: TaskFile) -> Path:
+    return Path(str(template).format(forcefield=task.spec.forcefield.replace("/", "_")))
+
+
 def verdict(
     work_dir: Path,
     task: TaskFile,
     *,
-    reference_path: Path = _REFERENCE,
-    reference_meta: Path = _REFERENCE_META,
+    reference_path: Path | None = None,
+    reference_meta: Path | None = None,
 ) -> dict[str, Any]:
+    if reference_path is None:
+        reference_path = _for_forcefield(_REFERENCE, task)
+    if reference_meta is None:
+        reference_meta = _for_forcefield(_REFERENCE_META, task)
     rows = store.list_rounds(work_dir)
     notes = store.list_ledger_notes(work_dir)
     low, high = task.campaign["state_thresholds"]
@@ -421,10 +432,13 @@ def _fmt(v: Any) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, default=None)
-    parser.add_argument("--max-rounds", type=int, default=20)
+    parser.add_argument("--max-rounds", type=int, default=40)
+    parser.add_argument("--max-extension-ns", type=float, default=5.0,
+                        help="ceiling on one extend round; the task file owns the budget")
     parser.add_argument("--dry-run", action="store_true", help="0.05 ns opening, 0.1 ns biased cap")
     parser.add_argument("--verdict-only", action="store_true", help="score an existing campaign")
-    parser.add_argument("--reference", type=Path, default=_REFERENCE)
+    parser.add_argument("--reference", type=Path, default=None,
+                        help="reference surface; defaults to the task's force field's")
     args = parser.parse_args(argv)
 
     task = load_task_file(_TASK_FILE)
@@ -432,7 +446,8 @@ def main(argv: list[str] | None = None) -> int:
         "campaigns/cln025_e2e_dryrun" if args.dry_run else "campaigns/cln025_e2e"
     )
     if not args.verdict_only:
-        run(task, work_dir, dry_run=args.dry_run, max_rounds=args.max_rounds)
+        run(task, work_dir, dry_run=args.dry_run, max_rounds=args.max_rounds,
+            max_extension_ns=args.max_extension_ns)
 
     result = verdict(work_dir, task, reference_path=args.reference)
     (work_dir / "verdict.json").write_text(json.dumps(result, indent=2))

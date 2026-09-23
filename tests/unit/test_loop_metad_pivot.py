@@ -1998,3 +1998,18 @@ def test_a_torsion_in_the_set_gets_a_periodic_grid() -> None:
     assert loop_mod._grid_bounds(TorsionCV("t", (0, 1, 2, 3))) == ("-pi", "pi")
     assert loop_mod._grid_bounds(ContactsCV("q", ((0, 1),), 0.75)) == (-0.3, 1.3)
     assert loop_mod._grid_bounds(RmsdCV("r", (0, 1, 2), Path("/abs/r.pdb"))) == (-0.2, 2.5)
+
+
+def test_absence_is_counted_in_frames_as_well_as_rounds(tmp_path: Path) -> None:
+    """Rounds are whatever length the schedule makes them; the scientist's
+    trigger is stated in nanoseconds, so the frames behind the count travel
+    with it."""
+    rounds = tmp_path / "rounds"
+    _write_obs(rounds, 2, 0.157, 0.811)   # 50 frames each, visited both
+    _write_obs(rounds, 3, 0.026, 0.550)
+    _write_obs(rounds, 4, 0.030, 0.547)
+
+    absence = loop_mod._absence(rounds, 4, (0.3, 0.7))
+
+    assert absence["high"] == (2, 100)     # two rounds, 100 frames away from the folded state
+    assert absence["low"] == (0, 0)

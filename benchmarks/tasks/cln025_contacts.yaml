@@ -37,7 +37,12 @@ equilibration:
 
 system:
   starting_pdb: "5AWL"
-  forcefield: amber14/tip3p
+  # ff99SB-ILDN + TIP3P: the family the literature favours for this hairpin.
+  # ff14SB/TIP3P put CLN025's unfolded ensemble 25-36 kJ/mol below the
+  # native state in three independent runs (Pang 2016 agrees: 7% native at
+  # 277 K); Robustelli et al. 2018 found a99SB*-ILDN and CHARMM22* closest
+  # to the measured melting curve, and ff99SB-ILDN sits in that family.
+  forcefield: amber99sbildn/tip3p
   padding_nm: 1.5              # post-F11; sized for the unfolded ensemble, not the folded start
   ionic_strength_M: 0.15
   nonbonded_cutoff_nm: 1.0     # declared and checked against the adapter
@@ -97,4 +102,10 @@ done_criterion:
     low:  { name: "unfolded",             threshold: 0.3 }
     high: { name: "native beta-hairpin",  threshold: 0.7 }
   min_recrossings: 2
-  max_biased_ns: 20.0
+  # Measured on this system: a round trip on a working coordinate costs
+  # 5-10 ns, dry spells of 20 ns happen, the absence signal takes ~8 ns to
+  # fire, and a well-tempered surface wants several round trips after the
+  # bias has stopped growing. 20 ns showed the pivot, the diagnosis and the
+  # escalation with 3 ns to spare; 100 ns is what it takes to see the
+  # escalation pay off.
+  max_biased_ns: 100.0

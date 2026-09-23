@@ -16,7 +16,7 @@ same side of them. Nothing deposited on it is worth keeping.
 - `add_cv` when the coordinate was *insufficient*: it separates the states —
 the walker crossed on it, `recrossings` is non-zero on the task basis — but
 cannot bring the system back, and `fes_depth_kj_per_mol` keeps rising while
-`rounds_since_high_visited` (or `_low_`) climbs. The barrier that gates the
+`ns_since_high_visited` (or `_low_`) climbs past ~8 ns. The barrier that gates the
 return is then along some *other* coordinate the bias never touches. Add the
 one you believe carries it. For a hairpin that is the turn — backbone torsions
 of the turn residues, or the cross-strand distance that sets the register —
