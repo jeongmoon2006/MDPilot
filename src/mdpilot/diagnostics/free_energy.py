@@ -475,7 +475,7 @@ def metad_report(
     statistic, which reads downstream as `not_evaluable`.
     """
     n_hills, header_cv = _hills_summary(Path(hills_path))
-    if n_hills == 0 and header_cv is not None:
+    if n_hills == 0:
         return {
             "hills_path": str(hills_path),
             "fes_path": None,
@@ -607,16 +607,17 @@ def metad_report(
     return report
 
 
-def _hills_summary(hills_path: Path) -> tuple[int, str | None]:
+def _hills_summary(hills_path: Path) -> tuple[int | None, str | None]:
     """(number of hill rows, the CV label from the `#! FIELDS` header).
 
-    A missing file is `(0, None)` and is *not* the header-only case: it is
-    left to `sum_hills` to report, so a caller that stubs `sum_hills` — the
-    unit tests do — is not short-circuited."""
+    A file that exists with no hill rows — PLUMED leaves it *empty*, not even
+    a header, until the first deposit — is `(0, ...)`. A missing file is
+    `(None, None)` and is left to `sum_hills` to report, so a caller that
+    stubs `sum_hills` — the unit tests do — is not short-circuited."""
     n = 0
     cv_label: str | None = None
     if not hills_path.exists():
-        return 0, None
+        return None, None
     with hills_path.open() as fh:
         for line in fh:
             if line.startswith("#! FIELDS"):

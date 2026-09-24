@@ -864,6 +864,32 @@ Three things the table says.
    of every campaign and should be fixed before any latency number is taken
    seriously.
 
+**The six faults, dry run** (`benchmarks/run_faults.py --dry-run`, 0.05 ns
+opening, 0.1 ns biased cap, `gates_only`; ~3 min each on the GTX 1660,
+`campaigns/faults_dryrun/`). A dry run proves the plumbing — every fault
+builds, runs under PLUMED, replays, scores — and it also says which faults
+are visible at 100 ps:
+
+| fault | detected at 0.1 ns | by |
+|---|---|---|
+| `thresholds_inside_one_basin` | **yes, at 0.1 ns** | `state_definition_invariance` |
+| `rmsd_no_configured_wall` | no | (needs the walker to leave and not return: ≥ 8 ns) |
+| `wall_inside_transition_region` | no | (needs frames at the wall) |
+| `truncated_budget` | no | (needs two windows with both states populated) |
+| `walker_pinned_weak_bias` | no | (needs ≥ 8 ns absent or confined) |
+| `gamma_too_small` | no | (same) |
+
+`gates_only` false-accept rate 0/6, trivially: at 100 ps the precision gate
+is false everywhere. The number that matters — the false-accept rate per
+arm on full 20 ns broken campaigns, and each arm's detection latency — needs
+the full-length runs: six campaigns of ~5 h GPU each, plus the two LLM arms
+at one call per round per arm. Not launched in this session; the command is
+`python -m benchmarks.run_faults --arms gates_only,lm_only,lm_plus_gates`.
+One fault is already informative: a task whose two states sit in one basin
+is refuted within the first biased round by the threshold perturbation,
+which is the cheapest possible check and the one no earlier version of the
+agent could make.
+
 Also found by these runs and fixed in the same session: `switch_cv` with a
 null proposal was a bare `RuntimeError` out of the parser (it ended the v1
 replay); it is now `MalformedDecision`, retried like a misquote and converted

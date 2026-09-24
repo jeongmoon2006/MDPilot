@@ -504,5 +504,9 @@ def test_a_hills_file_with_no_hills_yet_yields_a_report_not_a_segfault(tmp_path:
     report = metad_report(hills, None, tmp_path / "fes", min_recrossings=2)
 
     assert report["n_fes_estimates"] == 0 and report["cv_label"] == "q_ca"
+    # PLUMED actually leaves the file *empty* until the first deposit.
+    hills.write_text("")
+    empty = metad_report(hills, None, tmp_path / "fes", min_recrossings=2)
+    assert empty["n_fes_estimates"] == 0 and empty["cv_label"] is None
     assert report["fes_drift_kj_per_mol"] is None and report["fes_converged"] is None
     assert report["min_recrossings"] == 2 and "no hills" in report["note"]
